@@ -10,8 +10,8 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { gunzipSync } from 'node:zlib';
-import { insertEvents, openDb, queryEvents } from './db.mjs';
-import { buildJourneys, parseSince, report } from './journeys.mjs';
+import { insertEvents, openDb } from './db.mjs';
+import { readInWorker, runRead } from './reads.mjs';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // after decompression
 const MAX_EVENTS_PER_REQUEST = 2000;
@@ -46,7 +46,9 @@ async function readBody(req) {
     return JSON.parse(body.toString('utf8'));
 }
 
-export function createApp({ db, ingestToken, readToken = ingestToken }) {
+// `dbPath` (a file) moves the read endpoints off the main thread; without it (the
+// in-memory test DB, which a worker can't see) they run inline.
+export function createApp({ db, dbPath = null, ingestToken, readToken = ingestToken }) {
     if (!ingestToken) throw new Error('INGEST_TOKEN is required');
     return createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
@@ -63,20 +65,9 @@ export function createApp({ db, ingestToken, readToken = ingestToken }) {
             }
             if (req.method === 'GET' && (url.pathname === '/report' || url.pathname === '/journeys')) {
                 if (!tokenMatches(req.headers.authorization, readToken)) return send(res, 401, { error: 'unauthorized' });
-                const userParam = url.searchParams.get('user_id');
-                const events = queryEvents(db, {
-                    since: parseSince(url.searchParams.get('since') ?? '7d'),
-                    until: parseSince(url.searchParams.get('until')),
-                    userId: userParam ? Number(userParam) : null,
-                    includeStudio: url.searchParams.get('studio') !== '0',
-                });
-                const journeys = buildJourneys(events);
-                if (url.pathname === '/report') {
-                    const timelines = Number(url.searchParams.get('timelines') ?? 20);
-                    return send(res, 200, report(journeys, { timelines }), 'text/markdown');
-                }
-                const limit = Number(url.searchParams.get('limit') ?? 100);
-                return send(res, 200, journeys.slice(-limit));
+                const query = Object.fromEntries(url.searchParams);
+                const result = dbPath ? await readInWorker(dbPath, url.pathname, query) : runRead(db, url.pathname, query);
+                return send(res, result.status, result.body, result.type);
             }
             return send(res, 404, { error: 'not found' });
         } catch (error) {
@@ -96,8 +87,9 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
         console.error('INGEST_TOKEN is required when HOST is not loopback');
         process.exit(1);
     }
-    const db = openDb(process.env.DB_PATH ?? './data/clicks.db');
-    createApp({ db, ingestToken, readToken: process.env.READ_TOKEN || undefined }).listen(port, host, () => {
+    const dbPath = process.env.DB_PATH ?? './data/clicks.db';
+    const db = openDb(dbPath);
+    createApp({ db, dbPath, ingestToken, readToken: process.env.READ_TOKEN || undefined }).listen(port, host, () => {
         console.log(`click-log-server listening on http://${host}:${port}`);
     });
 }
