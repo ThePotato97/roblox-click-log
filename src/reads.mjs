@@ -5,7 +5,7 @@
 // and /ingest; before this, a single 24h report blocked them past the readiness
 // probe's timeout and the pod dropped out of service.
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
-import { DatabaseSync } from 'node:sqlite';
+import { Database } from 'bun:sqlite';
 import { queryEvents } from './db.mjs';
 import { buildJourneys, parseSince, report } from './journeys.mjs';
 
@@ -55,7 +55,7 @@ export function readInWorker(dbPath, pathname, query) {
 }
 
 if (!isMainThread && workerData?.dbPath) {
-    const db = new DatabaseSync(workerData.dbPath, { readOnly: true });
+    const db = new Database(workerData.dbPath, { readonly: true, strict: true });
     try {
         parentPort.postMessage(runRead(db, workerData.pathname, workerData.query));
     } finally {
