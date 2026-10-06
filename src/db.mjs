@@ -114,7 +114,7 @@ export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
 
 // Columns a journey reads. received_at, place_id, job_id, studio and id are
 // write-side bookkeeping, and every extra column costs a JS property per row.
-const READ_COLUMNS = 'rowid AS seq, at, user_id, session_id, place, kind, name, menu, x, y, value, props';
+const READ_COLUMNS = 'at, user_id, session_id, place, kind, name, menu, x, y, value, props';
 
 // Events grouped by player, in time order, optionally filtered. Studio rows are
 // excluded unless asked; ground taps/touches (GROUND_TAPS) always are.
@@ -140,15 +140,17 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
         params.userId = userId;
     }
     if (!includeStudio) where.push('studio = 0');
-    where.push(`NOT (kind = 'world' AND name IN (${[...GROUND_TAPS].map((n) => `'${n}'`).join(', ')}))`);
+    where.push(`NOT (kind = 'world' AND name IN (SELECT value FROM json_each($ground)))`);
+    params.ground = JSON.stringify([...GROUND_TAPS]);
     const sql = `SELECT ${READ_COLUMNS} FROM events WHERE ${where.join(' AND ')}`;
     const statement = db.prepare(sql);
     // rows as arrays, copied into literals: node:sqlite's row objects are
     // slow-mode dictionaries (~3x the memory, and every later pass pays for them)
     statement.setReturnArrays(true);
     const rows = [];
-    for (const [seq, at, user_id, session_id, place, kind, name, menu, x, y, value, props] of statement.iterate(params)) {
-        rows.push({ seq, at, user_id, session_id, place, kind, name, menu, x, y, value, props: props ? JSON.parse(props) : null });
+    for (const [at, user_id, session_id, place, kind, name, menu, x, y, value, props] of statement.iterate(params)) {
+        rows.push({ at, user_id, session_id, place, kind, name, menu, x, y, value, props: props ? JSON.parse(props) : null });
     }
-    return rows.sort((a, b) => a.user_id - b.user_id || a.at - b.at || a.seq - b.seq);
+    // stable sort; every plan yields same-time rows in rowid order
+    return rows.sort((a, b) => a.user_id - b.user_id || a.at - b.at);
 }

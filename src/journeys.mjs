@@ -75,7 +75,6 @@ export function buildJourneys(events, gapSeconds = GAP_SECONDS) {
 
 function summarise(journey) {
     const clicks = journey.events.filter((e) => e.kind !== 'event');
-    const first = journey.events.find((e) => e.kind === 'event' && e.name === 'session_started');
     const end = journey.events.findLast((e) => e.kind === 'event' && e.name === 'session_ended');
     const userType = end?.props?.user_type ?? null;
     return {
@@ -85,7 +84,7 @@ function summarise(journey) {
         clickCount: clicks.length,
         // is this the player's first-ever visit? (new = join-time snapshot)
         userType: typeof userType === 'string' ? userType.replace(/^User - /, '').toLowerCase() : null,
-        sawStart: Boolean(first),
+        sawStart: journey.events.some((e) => e.kind === 'event' && e.name === 'session_started'),
         rage: findRageClicks(clicks),
     };
 }

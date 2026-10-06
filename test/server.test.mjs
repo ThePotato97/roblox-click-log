@@ -59,6 +59,10 @@ test('ingest stores gzip batches, rejects bad auth, ignores retries', async () =
 
         const md = await (await fetch(`${base}/report?since=${T0 - 1}`, { headers: { Authorization: 'Bearer secret' } })).text();
         assert.match(md, /# Player journey report/);
+
+        const read = (path) => fetch(`${base}${path}`, { headers: { Authorization: 'Bearer secret' } });
+        assert.equal((await read('/report?since=nonsense')).status, 400);
+        assert.deepEqual(await (await read(`/journeys?since=${T0 - 1}&limit=0`)).json(), []);
     });
 });
 
