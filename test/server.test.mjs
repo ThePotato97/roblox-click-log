@@ -97,6 +97,35 @@ test('ground taps are dropped, taps on things in the world are kept', () => {
     assert.equal(journey.clickCount, 1);
 });
 
+test('windowed reads skip ground touches in SQL and come back per player in time order', () => {
+    const db = openDb(':memory:');
+    insertEvents(db, [
+        ev(2, 105, 'button', 'Hud/B'),
+        ev(1, 103, 'world', 'touch:Collision'),
+        ev(1, 102, 'world', 'touch:Teleport/Teleport'),
+        ev(2, 101, 'world', 'touch:VisibleWall'),
+        ev(1, 104, 'button', 'Hud/A'),
+        ev(1, 50, 'button', 'Hud/Old'),
+    ]);
+    const rows = queryEvents(db, { since: T0 + 100 });
+    assert.deepEqual(
+        rows.map((e) => [e.user_id, e.at - T0, e.name]),
+        [
+            [1, 102, 'touch:Teleport/Teleport'],
+            [1, 104, 'Hud/A'],
+            [2, 105, 'Hud/B'],
+        ],
+    );
+    assert.equal(queryEvents(db, { since: T0 + 100, includeGround: true }).length, 5);
+    // the time window must be a range on events_at, never a walk of the whole table
+    const plan = db
+        .prepare(`EXPLAIN QUERY PLAN SELECT * FROM events INDEXED BY events_at WHERE at >= 100`)
+        .all()
+        .map((r) => r.detail)
+        .join(';');
+    assert.match(plan, /SEARCH events USING INDEX events_at/);
+});
+
 test('reads on a file DB run off the main thread, so /health answers mid-report', async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');

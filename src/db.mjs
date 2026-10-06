@@ -3,6 +3,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { GROUND_TAPS } from './journeys.mjs';
 
 const KINDS = new Set(['button', 'world', 'event']);
 const MAX_ID = 64;
@@ -110,8 +111,20 @@ export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
     return { accepted, rejected };
 }
 
-// Events in time order, optionally filtered. Studio rows are excluded unless asked.
-export function queryEvents(db, { since = null, until = null, userId = null, includeStudio = false } = {}) {
+// Columns a journey reads. received_at, place_id, job_id, studio and id are
+// write-side bookkeeping, and every extra column costs a JS property per row.
+const READ_COLUMNS = 'rowid AS seq, at, user_id, session_id, place, kind, name, menu, x, y, value, props';
+
+// Events grouped by player, in time order, optionally filtered. Studio rows are
+// excluded unless asked, and so are ground taps/touches (see GROUND_TAPS) unless
+// includeGround is set.
+//
+// Rows come off the `at` index in time order and are sorted here. Asking SQLite
+// for ORDER BY user_id, at instead makes it walk events_user_at over the WHOLE
+// table and fetch every row by rowid at random to apply the time filter, which
+// is what made a 1h report take 11s. Rows are streamed with iterate() rather
+// than all() so only the kept rows are ever held.
+export function queryEvents(db, { since = null, until = null, userId = null, includeStudio = false, includeGround = false } = {}) {
     const where = [];
     const params = {};
     if (since !== null) {
@@ -127,10 +140,24 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
         params.userId = userId;
     }
     if (!includeStudio) where.push('studio = 0');
-    const sql = `SELECT * FROM events ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-                 ORDER BY user_id, at, rowid`;
-    return db.prepare(sql).all(params).map((row) => ({
-        ...row,
-        props: row.props ? JSON.parse(row.props) : null,
-    }));
+    if (!includeGround) {
+        const names = [...GROUND_TAPS].map((name, i) => {
+            params[`g${i}`] = name;
+            return `$g${i}`;
+        });
+        where.push(`NOT (kind = 'world' AND name IN (${names.join(', ')}))`);
+    }
+    // a single player's history is cheapest off their own index
+    const index = userId !== null ? 'events_user_at' : since !== null || until !== null ? 'events_at' : null;
+    const sql = `SELECT ${READ_COLUMNS} FROM events ${index ? `INDEXED BY ${index}` : ''}
+                 ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`;
+    const statement = db.prepare(sql);
+    // rows as arrays, copied into literals: node:sqlite's row objects are
+    // slow-mode dictionaries (~3x the memory, and every later pass pays for them)
+    statement.setReturnArrays(true);
+    const rows = [];
+    for (const [seq, at, user_id, session_id, place, kind, name, menu, x, y, value, props] of statement.iterate(params)) {
+        rows.push({ seq, at, user_id, session_id, place, kind, name, menu, x, y, value, props: props ? JSON.parse(props) : null });
+    }
+    return rows.sort((a, b) => a.user_id - b.user_id || a.at - b.at || a.seq - b.seq);
 }
