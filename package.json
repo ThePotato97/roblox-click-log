@@ -6,6 +6,6 @@
   "scripts": {
     "start": "bun src/server.mjs",
     "analyze": "bun src/analyze.mjs",
-    "test": "bun test"
+    "test": "npx -y bun@1.4.2 test"
   }
 }
