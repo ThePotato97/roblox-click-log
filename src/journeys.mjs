@@ -65,7 +65,9 @@ function summarise(journey) {
     return {
         ...journey,
         places: [...journey.places],
-        durationSeconds: journey.end - journey.start,
+        // session_ended carries the game's own session length; the first/last
+        // event span undercounts sessions that began before the read window
+        durationSeconds: end?.value ?? journey.end - journey.start,
         clickCount: clicks.length,
         // is this the player's first-ever visit? (new = join-time snapshot)
         userType: typeof userType === 'string' ? userType.replace(/^User - /, '').toLowerCase() : null,
@@ -177,6 +179,7 @@ export function report(journeys, { timelines = 20, contextSteps = 3 } = {}) {
                 ['ended with a quit', `${ended.length} (${pct(ended.length, journeys.length)})`],
                 ['new-player journeys', newOnes.length],
                 ['median journey length', fmtClock(median(journeys.map((j) => j.durationSeconds)))],
+                ['mean journey length', fmtClock(journeys.reduce((sum, j) => sum + j.durationSeconds, 0) / journeys.length)],
                 ['median clicks / journey', median(journeys.map((j) => j.clickCount))],
                 ['journeys under 3 min', pct(journeys.filter((j) => j.durationSeconds < 180).length, journeys.length)],
             ],

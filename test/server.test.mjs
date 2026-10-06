@@ -76,6 +76,8 @@ test('journeys split on quit and long gaps, and spot rage clicks', () => {
     assert.equal(first.userType, 'new');
     assert.equal(first.clickCount, 6);
     assert.deepEqual(first.rage.map((r) => r.count), [4]);
+    // a session that began before the read window keeps its full length
+    assert.equal(buildJourneys(queryEvents(db, { since: T0 + 5, until: T0 + 100 }))[0].durationSeconds, 60);
     const md = report(journeys, { timelines: 5 });
     assert.match(md, /MainUI\/…\/Card\/BuyButton/);
     assert.match(md, /×4/);
