@@ -86,13 +86,16 @@ test('mashing the speed upgrade is not rage, mashing a close button is', () => {
     );
 });
 
-test('ground taps are dropped, taps on things in the world are kept', () => {
+test('ground taps and touches are dropped, ones on things in the world are kept', () => {
     const tap = (name, at) => ({ user_id: 1, at, kind: 'world', name, place: 'Game' });
     const [journey] = buildJourneys([
         tap('world:Collision', 0),
         tap('world:Drops/GemRegular', 1),
         tap('world:Lobby/floor', 2),
+        tap('touch:Collision', 3),
+        tap('touch:Lobby/floor', 4),
+        tap('touch:Model/Bomb', 5),
     ]);
-    assert.deepEqual(journey.events.map((e) => e.name), ['world:Drops/GemRegular']);
-    assert.equal(journey.clickCount, 1);
+    assert.deepEqual(journey.events.map((e) => e.name), ['world:Drops/GemRegular', 'touch:Model/Bomb']);
+    assert.equal(journey.clickCount, 2);
 });
