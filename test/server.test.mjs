@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
 import { insertEvents, openDb, queryEvents } from '../src/db.mjs';
-import { buildJourneys, report } from '../src/journeys.mjs';
+import { buildJourneys, findRageClicks, report } from '../src/journeys.mjs';
 import { createApp } from '../src/server.mjs';
 
 const T0 = 1_790_000_000;
@@ -75,4 +75,13 @@ test('journeys split on quit and long gaps, and spot rage clicks', () => {
     const md = report(journeys, { timelines: 5 });
     assert.match(md, /MainUI\/…\/Card\/BuyButton/);
     assert.match(md, /×4/);
+});
+
+test('mashing the speed upgrade is not rage, mashing a close button is', () => {
+    const burst = (name) => [0, 0.3, 0.6, 0.9].map((at) => ({ kind: 'button', name, at }));
+    assert.deepEqual(findRageClicks(burst('MainUI/Menus/SpeedUpgrade/Upgrades/CoinUpgrade/Catcher')), []);
+    assert.deepEqual(
+        findRageClicks(burst('MainUI/Menus/Shop/Header/CloseButton')).map((r) => r.count),
+        [4],
+    );
 });

@@ -8,6 +8,10 @@
 export const GAP_SECONDS = 30 * 60;
 const RAGE_WINDOW_SECONDS = 2;
 const RAGE_MIN_CLICKS = 4;
+// Buttons players are MEANT to mash, so a burst on them is never rage. Matched
+// against the click target path. The speed upgrade's coin buy button
+// (SpeedUpgrade -> CoinUpgrade) is bought level after level in quick taps.
+const RAGE_IGNORE = [/\/CoinUpgrade\//];
 const SESSION_EDGES = new Set(['session_started', 'session_ended', 'teleported']);
 
 // 'MainUI/Root/Shop/Items/Card/BuyButton' -> 'MainUI/…/Card/BuyButton': the
@@ -77,6 +81,10 @@ export function findRageClicks(clicks) {
     const bursts = [];
     let i = 0;
     while (i < clicks.length) {
+        if (RAGE_IGNORE.some((pattern) => pattern.test(clicks[i].name))) {
+            i++;
+            continue;
+        }
         let j = i;
         while (
             j + 1 < clicks.length &&

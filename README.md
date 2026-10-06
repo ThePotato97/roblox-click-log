@@ -89,7 +89,8 @@ The report covers:
 - the first 3 clicks of new players
 - most-clicked targets (with the menu open at the time) and button reach
 - **rage clicks**: 4 or more clicks on one target within 2 seconds, which usually
-  means a button looked clickable but didn't respond
+  means a button looked clickable but didn't respond (buttons meant to be mashed,
+  like the speed upgrade, are listed in `RAGE_IGNORE` in `src/journeys.mjs`)
 - common 3-click sequences
 - per-journey timelines like this:
 
