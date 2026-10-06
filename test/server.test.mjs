@@ -87,16 +87,26 @@ test('journeys split on quit and long gaps, and spot rage clicks', () => {
 test('new = first seen in the log; bounces get their own exit tables', () => {
     const db = openDb(':memory:');
     insertEvents(db, sample());
-    const all = JSON.parse(runRead(db, '/journeys', { since: String(T0 - 1) }).body);
+    const all = JSON.parse([...runRead(db, '/journeys', { since: String(T0 - 1) }).parts].join(''));
     assert.deepEqual(all.map((j) => [j.userId, j.userType]), [[1, 'new'], [1, 'returning'], [2, 'new']]);
     // a later window still knows user 1 played before it
-    const later = JSON.parse(runRead(db, '/journeys', { since: String(T0 + 3000) }).body);
+    const later = JSON.parse([...runRead(db, '/journeys', { since: String(T0 + 3000) }).parts].join(''));
     assert.deepEqual(later.map((j) => [j.userId, j.userType]), [[1, 'returning']]);
     const md = runRead(db, '/report', { since: String(T0 - 1) }).body;
     assert.match(md, /new-player journeys \| 2/);
     assert.match(md, /journeys under 15s \| 67%/);
     assert.match(md, /## Exit points, quit within 1 min \(0\)/);
     assert.match(md, /\| world:sky \| \(quit\) \| 1 \| 100% \|/);
+});
+
+test('batching players changes nothing in the output', () => {
+    const db = openDb(':memory:');
+    insertEvents(db, [...sample(), ev(3, 7, 'button', 'Hud/C'), ev(4, 8, 'button', 'Hud/D'), ev(4, 9, 'event', 'session_ended')]);
+    const q = { since: String(T0 - 1) };
+    const journeys = (query, batch) => [...runRead(db, '/journeys', query, batch).parts].join('');
+    for (const limit of ['2', '3', '100']) assert.equal(journeys({ ...q, limit }, 1), journeys({ ...q, limit }));
+    assert.equal(JSON.parse(journeys({ ...q, limit: '2' }, 1)).length, 2);
+    assert.equal(runRead(db, '/report', q, 1).body, runRead(db, '/report', q).body);
 });
 
 test('mashing the speed upgrade is not rage, mashing a close button is', () => {
@@ -174,10 +184,17 @@ test('reads on a file DB run off the main thread, so /health answers mid-report'
         assert.match(md, /# Player journey report/);
         assert.deepEqual(order, ['health', 'report']);
 
-        const journeys = await (await fetch(`${base}/journeys?since=${T0 - 1}&limit=5`, {
+        // streamed out of the worker in batches of 200
+        const journeys = await (await fetch(`${base}/journeys?since=${T0 - 1}&limit=1000`, {
             headers: { Authorization: 'Bearer secret' },
         })).json();
-        assert.equal(journeys.length, 5);
+        assert.equal(journeys.length, 400);
+        // fetch asks for gzip and inflates it; check it really went out compressed
+        const raw = await fetch(`${base}/journeys?since=${T0 - 1}&limit=1000`, {
+            headers: { Authorization: 'Bearer secret', 'Accept-Encoding': 'gzip' },
+            decompress: false,
+        });
+        assert.equal(raw.headers.get('content-encoding'), 'gzip');
     } finally {
         server.close();
         db.close();

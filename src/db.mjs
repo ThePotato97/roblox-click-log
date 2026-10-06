@@ -140,14 +140,8 @@ export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
 // write-side bookkeeping, and every extra column costs a JS property per row.
 const READ_COLUMNS = 'at, user_id, session_id, place, kind, name, menu, x, y, value, props';
 
-// Events grouped by player, in time order, optionally filtered. Studio rows are
-// excluded unless asked.
-//
-// Rows come off the `at` index in time order and are sorted here. Asking SQLite
-// for ORDER BY user_id, at instead makes it walk events_user_at over the WHOLE
-// table and fetch every row by rowid at random to apply the time filter, which
-// is what made a 1h report take 11s.
-export function queryEvents(db, { since = null, until = null, userId = null, includeStudio = false } = {}) {
+// The WHERE clause shared by the read queries. Studio rows are excluded unless asked.
+function readFilter({ since = null, until = null, userIds = null, includeStudio = false }) {
     const where = [];
     const params = {};
     if (since !== null) {
@@ -158,20 +152,50 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
         where.push('at < $until');
         params.until = until;
     }
-    if (userId !== null) {
-        where.push('user_id = $userId');
-        params.userId = userId;
+    if (userIds !== null) {
+        where.push('user_id IN (SELECT value FROM json_each($userIds))');
+        params.userIds = JSON.stringify(userIds);
     }
     if (!includeStudio) where.push('studio = 0');
     // ground rows can still be on disk until purgeGround finishes; loading
     // millions of them is what ran a 24h read out of memory
     where.push(`NOT (kind = 'world' AND name IN (SELECT value FROM json_each($ground)))`);
     params.ground = JSON.stringify([...GROUND_TAPS]);
-    const sql = `SELECT ${READ_COLUMNS} FROM events WHERE ${where.join(' AND ')}`;
-    // rows as arrays (values()), copied into plain objects
+    return { where: where.join(' AND '), params };
+}
+
+// Players with events in the window, ascending, so reads can work through them a
+// batch at a time instead of holding every event in the window at once.
+export function readUsers(db, filter = {}) {
+    const { where, params } = readFilter(filter);
+    return db.prepare(`SELECT DISTINCT user_id FROM events WHERE ${where} ORDER BY user_id`).values(params).map((r) => r[0]);
+}
+
+// Events grouped by player, in time order, optionally filtered to some players.
+// Without `userIds` rows come off the `at` index in time order and are sorted here
+// (ORDER BY user_id, at walks events_user_at over the WHOLE table, which made a 1h
+// report take 11s); with them each player is one events_user_at seek.
+export function queryEvents(db, filter = {}) {
+    const { where, params } = readFilter(filter);
+    // iterate() streams rows (values() materialised every row a second time), and
+    // the few distinct names/places/sessions are shared instead of one copy per row
+    const seen = new Map();
+    const intern = (s) => (s === null ? s : (seen.get(s) ?? (seen.set(s, s), s)));
     const rows = [];
-    for (const [at, user_id, session_id, place, kind, name, menu, x, y, value, props] of db.prepare(sql).values(params)) {
-        rows.push({ at, user_id, session_id, place, kind, name, menu, x, y, value, props: props ? JSON.parse(props) : null });
+    for (const r of db.prepare(`SELECT ${READ_COLUMNS} FROM events WHERE ${where}`).iterate(params)) {
+        rows.push({
+            at: r.at,
+            user_id: r.user_id,
+            session_id: intern(r.session_id),
+            place: intern(r.place),
+            kind: intern(r.kind),
+            name: intern(r.name),
+            menu: intern(r.menu),
+            x: r.x,
+            y: r.y,
+            value: r.value,
+            props: r.props ? JSON.parse(r.props) : null,
+        });
     }
     // stable sort; every plan yields same-time rows in rowid order
     return rows.sort((a, b) => a.user_id - b.user_id || a.at - b.at);
