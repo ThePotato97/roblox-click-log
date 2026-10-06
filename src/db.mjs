@@ -176,3 +176,11 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
     // stable sort; every plan yields same-time rows in rowid order
     return rows.sort((a, b) => a.user_id - b.user_id || a.at - b.at);
 }
+
+// Each player's first event anywhere in the log, for telling new players from
+// returning ones. One min() per player: SQLite answers it with a single
+// events_user_at seek, which an IN + GROUP BY (or a studio filter) would lose.
+export function firstSeen(db, userIds) {
+    const stmt = db.prepare('SELECT min(at) AS at FROM events WHERE user_id = ?');
+    return new Map([...userIds].map((id) => [id, stmt.get(id).at]));
+}

@@ -6,7 +6,7 @@
 // probe's timeout and the pod dropped out of service.
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { Database } from 'bun:sqlite';
-import { queryEvents } from './db.mjs';
+import { firstSeen, queryEvents } from './db.mjs';
 import { buildJourneys, parseSince, report } from './journeys.mjs';
 
 // Returns { status, type, body } for a read request. `query` is the URL's searchParams
@@ -27,6 +27,10 @@ export function runRead(db, pathname, query) {
         includeStudio: query.studio !== '0',
     });
     const journeys = buildJourneys(events);
+    // new = the player's first-ever event is in this journey's session. The game's
+    // own user_type tag is unreliable (always "Returning").
+    const first = firstSeen(db, new Set(journeys.map((j) => j.userId)));
+    for (const j of journeys) j.userType = first.get(j.userId) >= j.end - j.durationSeconds - 5 ? 'new' : 'returning';
     if (pathname === '/report') {
         const timelines = Number(query.timelines ?? 20);
         return { status: 200, type: 'text/markdown', body: report(journeys, { timelines }) };

@@ -4,6 +4,7 @@ import { gzipSync } from 'node:zlib';
 import { insertEvents, openDb, purgeGround, queryEvents } from '../src/db.mjs';
 import { buildJourneys, findRageClicks, report } from '../src/journeys.mjs';
 import { createApp } from '../src/server.mjs';
+import { runRead } from '../src/reads.mjs';
 
 const T0 = 1_790_000_000;
 let n = 0;
@@ -81,6 +82,20 @@ test('journeys split on quit and long gaps, and spot rage clicks', () => {
     const md = report(journeys, { timelines: 5 });
     assert.match(md, /MainUI\/…\/Card\/BuyButton/);
     assert.match(md, /×4/);
+});
+
+test('new = first seen in the log; bounces get their own exit tables', () => {
+    const db = openDb(':memory:');
+    insertEvents(db, sample());
+    const all = JSON.parse(runRead(db, '/journeys', { since: String(T0 - 1) }).body);
+    assert.deepEqual(all.map((j) => [j.userId, j.userType]), [[1, 'new'], [1, 'returning'], [2, 'new']]);
+    // a later window still knows user 1 played before it
+    const later = JSON.parse(runRead(db, '/journeys', { since: String(T0 + 3000) }).body);
+    assert.deepEqual(later.map((j) => [j.userId, j.userType]), [[1, 'returning']]);
+    const md = runRead(db, '/report', { since: String(T0 - 1) }).body;
+    assert.match(md, /new-player journeys \| 2/);
+    assert.match(md, /journeys under 15s \| 67%/);
+    assert.match(md, /## Exit points, quit within 1 min \(0\)/);
 });
 
 test('mashing the speed upgrade is not rage, mashing a close button is', () => {

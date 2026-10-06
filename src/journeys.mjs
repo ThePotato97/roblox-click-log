@@ -12,6 +12,8 @@ const RAGE_MIN_CLICKS = 4;
 // against the click target path. The speed upgrade's coin buy button
 // (SpeedUpgrade -> CoinUpgrade) is bought level after level in quick taps.
 const RAGE_IGNORE = [/\/CoinUpgrade\//];
+// bounce cut-offs, shortest first
+const BOUNCES = [['15s', 15], ['1 min', 60], ['3 min', 180]];
 const SESSION_EDGES = new Set(['session_started', 'session_ended', 'teleported']);
 
 // 'MainUI/Root/Shop/Items/Card/BuyButton' -> 'MainUI/…/Card/BuyButton': the
@@ -181,7 +183,7 @@ export function report(journeys, { timelines = 20, contextSteps = 3 } = {}) {
                 ['median journey length', fmtClock(median(journeys.map((j) => j.durationSeconds)))],
                 ['mean journey length', fmtClock(journeys.reduce((sum, j) => sum + j.durationSeconds, 0) / journeys.length)],
                 ['median clicks / journey', median(journeys.map((j) => j.clickCount))],
-                ['journeys under 3 min', pct(journeys.filter((j) => j.durationSeconds < 180).length, journeys.length)],
+                ...BOUNCES.map(([name, seconds]) => [`journeys under ${name}`, pct(journeys.filter((j) => j.durationSeconds < seconds).length, journeys.length)]),
             ],
             ['metric', 'value'],
         ),
@@ -189,15 +191,21 @@ export function report(journeys, { timelines = 20, contextSteps = 3 } = {}) {
     );
 
     // where players leave: the last few actions before each quit
-    const exits = ended.map((j) =>
-        j.events
-            .filter((e) => !SESSION_EDGES.has(e.name) || e.kind !== 'event')
-            .slice(-contextSteps)
-            .map(label)
-            .join(' → '),
-    );
+    const exits = (list) =>
+        list.map((j) =>
+            j.events
+                .filter((e) => !SESSION_EDGES.has(e.name) || e.kind !== 'event')
+                .slice(-contextSteps)
+                .map(label)
+                .join(' → '),
+        );
     out.push(`## Exit points (last ${contextSteps} actions before quitting)`, '');
-    out.push(table(countTop(exits, 15).map(([path, n]) => [path || '(nothing)', n, pct(n, ended.length)]), ['path', 'quits', 'share']), '');
+    out.push(table(countTop(exits(ended), 15).map(([path, n]) => [path || '(nothing)', n, pct(n, ended.length)]), ['path', 'quits', 'share']), '');
+    for (const [name, seconds] of BOUNCES) {
+        const bounced = ended.filter((j) => j.durationSeconds < seconds);
+        out.push(`## Exit points, quit within ${name} (${bounced.length})`, '');
+        out.push(table(countTop(exits(bounced), 10).map(([path, n]) => [path || '(nothing)', n, pct(n, bounced.length)]), ['path', 'quits', 'share']), '');
+    }
 
     const lastMenus = ended.map((j) => j.events.findLast((e) => e.kind !== 'event')?.menu ?? '(no menu open)');
     out.push('## Menu open at the last click before quitting', '');
