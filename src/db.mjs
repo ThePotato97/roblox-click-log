@@ -52,12 +52,19 @@ export function openDb(path) {
         CREATE INDEX IF NOT EXISTS events_user_at ON events (user_id, at);
         CREATE INDEX IF NOT EXISTS events_at ON events (at);
     `);
-    // one-time purge of ground rows stored before ingest refused them
-    if (db.prepare('PRAGMA user_version').get().user_version < 1) {
-        db.prepare(`DELETE FROM events WHERE kind = 'world' AND name IN (SELECT value FROM json_each(?))`).run(JSON.stringify([...GROUND_TAPS]));
-        db.exec('PRAGMA user_version = 1');
-    }
     return db;
+}
+
+// One-time purge of ground rows stored before ingest refused them. Runs after
+// the server is listening, a batch at a time, yielding between batches so
+// /health and /ingest keep answering however many rows there are.
+export async function purgeGround(db, batch = 5000) {
+    if (db.prepare('PRAGMA user_version').get().user_version >= 1) return;
+    const del = db.prepare(`DELETE FROM events WHERE rowid IN (
+        SELECT rowid FROM events WHERE kind = 'world' AND name IN (SELECT value FROM json_each(?)) LIMIT ?)`);
+    const names = JSON.stringify([...GROUND_TAPS]);
+    while (del.run(names, batch).changes > 0) await new Promise((r) => setTimeout(r, 0));
+    db.exec('PRAGMA user_version = 1');
 }
 
 const str = (value, max) => (typeof value === 'string' ? value.slice(0, max) : null);
