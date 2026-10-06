@@ -101,12 +101,14 @@ test('windowed reads skip ground touches in SQL and come back per player in time
     const db = openDb(':memory:');
     insertEvents(db, [
         ev(2, 105, 'button', 'Hud/B'),
-        ev(1, 103, 'world', 'touch:Collision'),
         ev(1, 102, 'world', 'touch:Teleport/Teleport'),
-        ev(2, 101, 'world', 'touch:VisibleWall'),
         ev(1, 104, 'button', 'Hud/A'),
         ev(1, 50, 'button', 'Hud/Old'),
     ]);
+    // ground touches are refused on arrival
+    assert.deepEqual(insertEvents(db, [ev(3, 106, 'world', 'touch:Collision')]), { accepted: 0, rejected: 1 });
+    // ...and rows stored before that are skipped by the query
+    db.prepare(`INSERT INTO events (id, at, received_at, user_id, kind, name) VALUES ('pre', ?, 0, 1, 'world', 'touch:Collision')`).run(T0 + 103);
     const rows = queryEvents(db, { since: T0 + 100 });
     assert.deepEqual(
         rows.map((e) => [e.user_id, e.at - T0, e.name]),

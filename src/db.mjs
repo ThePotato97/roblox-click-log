@@ -55,6 +55,7 @@ export function cleanEvent(raw, receivedAt) {
     const name = str(raw.name, MAX_NAME);
     if (!id || at === null || userId === null || !Number.isInteger(userId) || !name) return null;
     if (!KINDS.has(raw.kind)) return null;
+    if (raw.kind === 'world' && GROUND_TAPS.has(name)) return null; // never read, ~85% of volume
     let props = null;
     if (raw.props && typeof raw.props === 'object') {
         const json = JSON.stringify(raw.props);

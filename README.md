@@ -95,7 +95,8 @@ The report covers:
 - ground taps and touches (`GROUND_TAPS` in `src/journeys.mjs`, e.g. the
   invisible floor under the map, the boundary walls) are left out of all of it,
   in the SQL query itself: they're players tapping to move or a character
-  walking, and outnumber everything else several times over. They're still stored.
+  walking, and outnumber everything else several times over. New ones are
+  refused at ingest (counted as `rejected`); older rows are skipped by the query.
 - per-journey timelines like this:
 
 ```
