@@ -13,9 +13,16 @@ import { buildJourneys, parseSince, report } from './journeys.mjs';
 // as a plain object so it can cross the thread boundary.
 export function runRead(db, pathname, query) {
     const userParam = query.user_id;
+    let since, until;
+    try {
+        since = parseSince(query.since ?? '7d');
+        until = parseSince(query.until);
+    } catch (error) {
+        return { status: 400, type: 'application/json', body: JSON.stringify({ error: error.message }) };
+    }
     const events = queryEvents(db, {
-        since: parseSince(query.since ?? '7d'),
-        until: parseSince(query.until),
+        since,
+        until,
         userId: userParam ? Number(userParam) : null,
         includeStudio: query.studio !== '0',
     });
@@ -25,7 +32,7 @@ export function runRead(db, pathname, query) {
         return { status: 200, type: 'text/markdown', body: report(journeys, { timelines }) };
     }
     const limit = Number(query.limit ?? 100);
-    return { status: 200, type: 'application/json', body: JSON.stringify(journeys.slice(-limit)) };
+    return { status: 200, type: 'application/json', body: JSON.stringify(journeys.slice(Math.max(0, journeys.length - limit))) };
 }
 
 // One read at a time: each holds a whole window of events in memory, so letting them

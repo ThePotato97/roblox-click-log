@@ -59,6 +59,10 @@ test('ingest stores gzip batches, rejects bad auth, ignores retries', async () =
 
         const md = await (await fetch(`${base}/report?since=${T0 - 1}`, { headers: { Authorization: 'Bearer secret' } })).text();
         assert.match(md, /# Player journey report/);
+
+        const read = (path) => fetch(`${base}${path}`, { headers: { Authorization: 'Bearer secret' } });
+        assert.equal((await read('/report?since=nonsense')).status, 400);
+        assert.deepEqual(await (await read(`/journeys?since=${T0 - 1}&limit=0`)).json(), []);
     });
 });
 
@@ -86,15 +90,36 @@ test('mashing the speed upgrade is not rage, mashing a close button is', () => {
     );
 });
 
-test('ground taps are dropped, taps on things in the world are kept', () => {
-    const tap = (name, at) => ({ user_id: 1, at, kind: 'world', name, place: 'Game' });
-    const [journey] = buildJourneys([
-        tap('world:Collision', 0),
-        tap('world:Drops/GemRegular', 1),
-        tap('world:Lobby/floor', 2),
+test('ground touches are refused and purged; reads come back per player in time order', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'clicklog-'));
+    let db = openDb(join(dir, 'clicks.db'));
+    insertEvents(db, [
+        ev(2, 105, 'button', 'Hud/B'),
+        ev(1, 102, 'world', 'touch:Teleport/Teleport'),
+        ev(1, 104, 'button', 'Hud/A'),
+        ev(1, 50, 'button', 'Hud/Old'),
     ]);
-    assert.deepEqual(journey.events.map((e) => e.name), ['world:Drops/GemRegular']);
-    assert.equal(journey.clickCount, 1);
+    // ground touches are refused on arrival
+    assert.deepEqual(insertEvents(db, [ev(3, 106, 'world', 'touch:Collision')]), { accepted: 0, rejected: 1 });
+    // ...and rows stored before that are purged once on open
+    db.prepare(`INSERT INTO events (id, at, received_at, user_id, kind, name) VALUES ('pre', ?, 0, 1, 'world', 'touch:Collision')`).run(T0 + 103);
+    db.exec('PRAGMA user_version = 0');
+    db.close();
+    db = openDb(join(dir, 'clicks.db'));
+    const rows = queryEvents(db, { since: T0 + 100 });
+    assert.deepEqual(
+        rows.map((e) => [e.user_id, e.at - T0, e.name]),
+        [
+            [1, 102, 'touch:Teleport/Teleport'],
+            [1, 104, 'Hud/A'],
+            [2, 105, 'Hud/B'],
+        ],
+    );
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
 });
 
 test('reads on a file DB run off the main thread, so /health answers mid-report', async () => {

@@ -78,7 +78,7 @@ export function createApp({ db, dbPath = null, ingestToken, readToken = ingestTo
     });
 }
 
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('server.mjs')) {
+if (process.argv[1]?.endsWith('server.mjs')) {
     const host = process.env.HOST ?? '127.0.0.1';
     const port = Number(process.env.PORT ?? 8787);
     const loopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';

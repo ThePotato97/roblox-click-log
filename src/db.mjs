@@ -9,6 +9,18 @@ const MAX_ID = 64;
 const MAX_NAME = 200;
 const MAX_SHORT = 100;
 const MAX_PROPS_JSON = 4096;
+// World taps and touches on the map's structure (the invisible floor, the lobby
+// floor, the boundary walls): players tapping to move or a character walking,
+// never interacting with anything. ~85% of what the game sent (touch:Collision
+// alone ~39k an hour), so they're refused at ingest and were purged once.
+const GROUND_TAPS = new Set([
+    'world:Collision',
+    'world:Lobby/floor',
+    'touch:Collision',
+    'touch:Lobby/floor',
+    'touch:InvisibleBackstop',
+    'touch:VisibleWall',
+]);
 
 export function openDb(path) {
     if (path !== ':memory:') {
@@ -39,6 +51,11 @@ export function openDb(path) {
         CREATE INDEX IF NOT EXISTS events_user_at ON events (user_id, at);
         CREATE INDEX IF NOT EXISTS events_at ON events (at);
     `);
+    // one-time purge of ground rows stored before ingest refused them
+    if (db.prepare('PRAGMA user_version').get().user_version < 1) {
+        db.prepare(`DELETE FROM events WHERE kind = 'world' AND name IN (SELECT value FROM json_each(?))`).run(JSON.stringify([...GROUND_TAPS]));
+        db.exec('PRAGMA user_version = 1');
+    }
     return db;
 }
 
@@ -54,6 +71,7 @@ export function cleanEvent(raw, receivedAt) {
     const name = str(raw.name, MAX_NAME);
     if (!id || at === null || userId === null || !Number.isInteger(userId) || !name) return null;
     if (!KINDS.has(raw.kind)) return null;
+    if (raw.kind === 'world' && GROUND_TAPS.has(name)) return null; // never read, ~85% of volume
     let props = null;
     if (raw.props && typeof raw.props === 'object') {
         const json = JSON.stringify(raw.props);
@@ -110,7 +128,18 @@ export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
     return { accepted, rejected };
 }
 
-// Events in time order, optionally filtered. Studio rows are excluded unless asked.
+// Columns a journey reads. received_at, place_id, job_id, studio and id are
+// write-side bookkeeping, and every extra column costs a JS property per row.
+const READ_COLUMNS = 'at, user_id, session_id, place, kind, name, menu, x, y, value, props';
+
+// Events grouped by player, in time order, optionally filtered. Studio rows are
+// excluded unless asked.
+//
+// Rows come off the `at` index in time order and are sorted here. Asking SQLite
+// for ORDER BY user_id, at instead makes it walk events_user_at over the WHOLE
+// table and fetch every row by rowid at random to apply the time filter, which
+// is what made a 1h report take 11s. Rows are streamed with iterate() rather
+// than all() so only the kept rows are ever held.
 export function queryEvents(db, { since = null, until = null, userId = null, includeStudio = false } = {}) {
     const where = [];
     const params = {};
@@ -127,10 +156,15 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
         params.userId = userId;
     }
     if (!includeStudio) where.push('studio = 0');
-    const sql = `SELECT * FROM events ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-                 ORDER BY user_id, at, rowid`;
-    return db.prepare(sql).all(params).map((row) => ({
-        ...row,
-        props: row.props ? JSON.parse(row.props) : null,
-    }));
+    const sql = `SELECT ${READ_COLUMNS} FROM events WHERE ${where.join(' AND ')}`;
+    const statement = db.prepare(sql);
+    // rows as arrays, copied into literals: node:sqlite's row objects are
+    // slow-mode dictionaries (~3x the memory, and every later pass pays for them)
+    statement.setReturnArrays(true);
+    const rows = [];
+    for (const [at, user_id, session_id, place, kind, name, menu, x, y, value, props] of statement.iterate(params)) {
+        rows.push({ at, user_id, session_id, place, kind, name, menu, x, y, value, props: props ? JSON.parse(props) : null });
+    }
+    // stable sort; every plan yields same-time rows in rowid order
+    return rows.sort((a, b) => a.user_id - b.user_id || a.at - b.at);
 }

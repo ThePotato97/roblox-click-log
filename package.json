@@ -4,7 +4,7 @@
   "description": "Stores ColorFillGame click journeys in SQLite and reports on them",
   "type": "module",
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22.16"
   },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/server.mjs",
