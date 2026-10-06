@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
 import { insertEvents, openDb, queryEvents } from '../src/db.mjs';
-import { buildJourneys, findRageClicks, report } from '../src/journeys.mjs';
+import { buildJourneys, report } from '../src/journeys.mjs';
 import { createApp } from '../src/server.mjs';
 
 const T0 = 1_790_000_000;
@@ -75,16 +75,4 @@ test('journeys split on quit and long gaps, and spot rage clicks', () => {
     const md = report(journeys, { timelines: 5 });
     assert.match(md, /MainUI\/…\/Card\/BuyButton/);
     assert.match(md, /×4/);
-});
-
-test('a burst on a button that responds is not rage', () => {
-    const taps = [10, 10.4, 10.8, 11.2, 11.6];
-    const speedBuys = taps.flatMap((t) => [
-        ev(3, t, 'button', 'MainUI/Root/Speed/BuyButton'),
-        ev(3, t + 0.1, 'event', 'Resource:Sink:coins:Upgrade:Speed', { value: 100 }),
-    ]);
-    assert.deepEqual(findRageClicks(speedBuys), []);
-
-    const deadButton = taps.map((t) => ev(3, t, 'button', 'MainUI/Root/Shop/DeadButton'));
-    assert.deepEqual(findRageClicks(deadButton).map((r) => r.count), [5]);
 });

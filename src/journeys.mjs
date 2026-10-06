@@ -8,8 +8,6 @@
 export const GAP_SECONDS = 30 * 60;
 const RAGE_WINDOW_SECONDS = 2;
 const RAGE_MIN_CLICKS = 4;
-// how long after a burst's last click a server beat still counts as its response
-const RAGE_SETTLE_SECONDS = 1;
 const SESSION_EDGES = new Set(['session_started', 'session_ended', 'teleported']);
 
 // 'MainUI/Root/Shop/Items/Card/BuyButton' -> 'MainUI/…/Card/BuyButton': the
@@ -69,19 +67,13 @@ function summarise(journey) {
         // is this the player's first-ever visit? (new = join-time snapshot)
         userType: typeof userType === 'string' ? userType.replace(/^User - /, '').toLowerCase() : null,
         sawStart: Boolean(first),
-        rage: findRageClicks(journey.events),
+        rage: findRageClicks(clicks),
     };
 }
 
 // Bursts of RAGE_MIN_CLICKS+ clicks on one target inside RAGE_WINDOW_SECONDS:
-// the usual sign a button looked clickable and didn't respond. A button that
-// works leaves server beats (a purchase, a menu event) during the burst, so a
-// burst with any event between its first click and RAGE_SETTLE_SECONDS after
-// its last is just someone mashing a working button (buying upgrades) and
-// isn't rage. Takes the journey's full time-ordered event list.
-export function findRageClicks(events) {
-    const clicks = events.filter((e) => e.kind !== 'event');
-    const beats = events.filter((e) => e.kind === 'event');
+// the usual sign a button looked clickable and didn't respond.
+export function findRageClicks(clicks) {
     const bursts = [];
     let i = 0;
     while (i < clicks.length) {
@@ -93,9 +85,7 @@ export function findRageClicks(events) {
         ) {
             j++;
         }
-        const from = clicks[i].at;
-        const to = clicks[j].at + RAGE_SETTLE_SECONDS;
-        if (j - i + 1 >= RAGE_MIN_CLICKS && !beats.some((e) => e.at >= from && e.at <= to)) {
+        if (j - i + 1 >= RAGE_MIN_CLICKS) {
             bursts.push({ target: shortTarget(clicks[i]), count: j - i + 1, at: clicks[i].at });
         }
         i = j + 1;
