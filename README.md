@@ -92,6 +92,9 @@ The report covers:
   means a button looked clickable but didn't respond (buttons meant to be mashed,
   like the speed upgrade, are listed in `RAGE_IGNORE` in `src/journeys.mjs`)
 - common 3-click sequences
+- ground taps (`GROUND_TAPS` in `src/journeys.mjs`, e.g. the invisible floor
+  under the map) are left out of all of it: they're players tapping to move or
+  look, and would outnumber every button. They're still stored.
 - per-journey timelines like this:
 
 ```
