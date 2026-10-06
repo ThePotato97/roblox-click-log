@@ -96,6 +96,7 @@ test('new = first seen in the log; bounces get their own exit tables', () => {
     assert.match(md, /new-player journeys \| 2/);
     assert.match(md, /journeys under 15s \| 67%/);
     assert.match(md, /## Exit points, quit within 1 min \(0\)/);
+    assert.match(md, /\| world:sky \| \(quit\) \| 1 \| 100% \|/);
 });
 
 test('mashing the speed upgrade is not rage, mashing a close button is', () => {

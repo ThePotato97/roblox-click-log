@@ -256,6 +256,31 @@ export function report(journeys, { timelines = 20, contextSteps = 3 } = {}) {
     out.push('## Common 3-click sequences', '');
     out.push(table(countTop(trigrams, 15).map(([t, n]) => [t, n]), ['sequence', 'times']), '');
 
+    // Sankey data: each step and what came next, repeats folded, quits as an end node
+    const edges = journeys.flatMap((j) => {
+        const steps = [];
+        for (const e of j.events) {
+            if (e.kind === 'event' && SESSION_EDGES.has(e.name)) continue;
+            const l = label(e);
+            if (steps.at(-1) !== l) steps.push(l);
+        }
+        if (j.ended) steps.push('(quit)');
+        return steps.slice(1).map((to, i) => `${steps[i]}\t${to}`);
+    });
+    const outgoing = countTop(edges.map((e) => e.split('\t')[0]), Infinity);
+    const fromTotal = new Map(outgoing);
+    out.push('## Transitions (what each step leads to)', '');
+    out.push(
+        table(
+            countTop(edges, 40).map(([e, n]) => {
+                const [from, to] = e.split('\t');
+                return [from, to, n, pct(n, fromTotal.get(from))];
+            }),
+            ['from', 'to', 'times', 'share of from'],
+        ),
+        '',
+    );
+
     if (timelines > 0) {
         const picked = [...journeys].sort((a, b) => b.start - a.start).slice(0, timelines);
         out.push(`## Journeys (${picked.length} most recent of ${journeys.length})`, '');
