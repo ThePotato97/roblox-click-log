@@ -116,15 +116,14 @@ export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
 const READ_COLUMNS = 'rowid AS seq, at, user_id, session_id, place, kind, name, menu, x, y, value, props';
 
 // Events grouped by player, in time order, optionally filtered. Studio rows are
-// excluded unless asked, and so are ground taps/touches (see GROUND_TAPS) unless
-// includeGround is set.
+// excluded unless asked; ground taps/touches (GROUND_TAPS) always are.
 //
 // Rows come off the `at` index in time order and are sorted here. Asking SQLite
 // for ORDER BY user_id, at instead makes it walk events_user_at over the WHOLE
 // table and fetch every row by rowid at random to apply the time filter, which
 // is what made a 1h report take 11s. Rows are streamed with iterate() rather
 // than all() so only the kept rows are ever held.
-export function queryEvents(db, { since = null, until = null, userId = null, includeStudio = false, includeGround = false } = {}) {
+export function queryEvents(db, { since = null, until = null, userId = null, includeStudio = false } = {}) {
     const where = [];
     const params = {};
     if (since !== null) {
@@ -140,17 +139,8 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
         params.userId = userId;
     }
     if (!includeStudio) where.push('studio = 0');
-    if (!includeGround) {
-        const names = [...GROUND_TAPS].map((name, i) => {
-            params[`g${i}`] = name;
-            return `$g${i}`;
-        });
-        where.push(`NOT (kind = 'world' AND name IN (${names.join(', ')}))`);
-    }
-    // a single player's history is cheapest off their own index
-    const index = userId !== null ? 'events_user_at' : since !== null || until !== null ? 'events_at' : null;
-    const sql = `SELECT ${READ_COLUMNS} FROM events ${index ? `INDEXED BY ${index}` : ''}
-                 ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`;
+    where.push(`NOT (kind = 'world' AND name IN (${[...GROUND_TAPS].map((n) => `'${n}'`).join(', ')}))`);
+    const sql = `SELECT ${READ_COLUMNS} FROM events WHERE ${where.join(' AND ')}`;
     const statement = db.prepare(sql);
     // rows as arrays, copied into literals: node:sqlite's row objects are
     // slow-mode dictionaries (~3x the memory, and every later pass pays for them)

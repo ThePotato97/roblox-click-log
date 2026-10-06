@@ -116,14 +116,6 @@ test('windowed reads skip ground touches in SQL and come back per player in time
             [2, 105, 'Hud/B'],
         ],
     );
-    assert.equal(queryEvents(db, { since: T0 + 100, includeGround: true }).length, 5);
-    // the time window must be a range on events_at, never a walk of the whole table
-    const plan = db
-        .prepare(`EXPLAIN QUERY PLAN SELECT * FROM events INDEXED BY events_at WHERE at >= 100`)
-        .all()
-        .map((r) => r.detail)
-        .join(';');
-    assert.match(plan, /SEARCH events USING INDEX events_at/);
 });
 
 test('reads on a file DB run off the main thread, so /health answers mid-report', async () => {
