@@ -3,12 +3,9 @@
   "private": true,
   "description": "Stores ColorFillGame click journeys in SQLite and reports on them",
   "type": "module",
-  "engines": {
-    "node": ">=22.16"
-  },
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning src/server.mjs",
-    "analyze": "node --disable-warning=ExperimentalWarning src/analyze.mjs",
-    "test": "node --disable-warning=ExperimentalWarning --test"
+    "start": "bun src/server.mjs",
+    "analyze": "bun src/analyze.mjs",
+    "test": "bun test"
   }
 }

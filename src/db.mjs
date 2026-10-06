@@ -1,8 +1,8 @@
-// SQLite store for the click journey log. Uses Node's built-in node:sqlite
-// (Node >= 22.13), so the server has no npm dependencies at all.
+// SQLite store for the click journey log. Uses Bun's built-in bun:sqlite, so the
+// server has no dependencies at all.
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { Database } from 'bun:sqlite';
 
 const KINDS = new Set(['button', 'world', 'event']);
 const MAX_ID = 64;
@@ -26,7 +26,8 @@ export function openDb(path) {
     if (path !== ':memory:') {
         mkdirSync(dirname(path), { recursive: true });
     }
-    const db = new DatabaseSync(path);
+    // strict: named params bind from plain keys ({ since }) to $since
+    const db = new Database(path, { strict: true });
     db.exec(`
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
@@ -138,8 +139,7 @@ const READ_COLUMNS = 'at, user_id, session_id, place, kind, name, menu, x, y, va
 // Rows come off the `at` index in time order and are sorted here. Asking SQLite
 // for ORDER BY user_id, at instead makes it walk events_user_at over the WHOLE
 // table and fetch every row by rowid at random to apply the time filter, which
-// is what made a 1h report take 11s. Rows are streamed with iterate() rather
-// than all() so only the kept rows are ever held.
+// is what made a 1h report take 11s.
 export function queryEvents(db, { since = null, until = null, userId = null, includeStudio = false } = {}) {
     const where = [];
     const params = {};
@@ -157,12 +157,9 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
     }
     if (!includeStudio) where.push('studio = 0');
     const sql = `SELECT ${READ_COLUMNS} FROM events WHERE ${where.join(' AND ')}`;
-    const statement = db.prepare(sql);
-    // rows as arrays, copied into literals: node:sqlite's row objects are
-    // slow-mode dictionaries (~3x the memory, and every later pass pays for them)
-    statement.setReturnArrays(true);
+    // rows as arrays (values()), copied into plain objects
     const rows = [];
-    for (const [at, user_id, session_id, place, kind, name, menu, x, y, value, props] of statement.iterate(params)) {
+    for (const [at, user_id, session_id, place, kind, name, menu, x, y, value, props] of db.prepare(sql).values(params)) {
         rows.push({ at, user_id, session_id, place, kind, name, menu, x, y, value, props: props ? JSON.parse(props) : null });
     }
     // stable sort; every plan yields same-time rows in rowid order

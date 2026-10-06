@@ -15,13 +15,13 @@ ClickLogSink (game server)   + every design event, funnel step, session start/en
 click-log-server (this)      SQLite (data/clicks.db)  →  /report, /journeys, analyze CLI
 ```
 
-There are no npm dependencies. It uses Node's built-in `node:http` and
-`node:sqlite`, so it needs **Node 22.13 or newer**.
+There are no dependencies. It runs on **Bun** (1.4+) and uses its built-in
+`bun:sqlite` plus `node:http`.
 
 ## Run it locally (Studio playtests)
 
 ```sh
-npm start          # http://127.0.0.1:8787, data in ./data/clicks.db
+bun start          # http://127.0.0.1:8787, data in ./data/clicks.db
 ```
 
 Then press Play in Studio. Studio sends to `http://localhost:8787/ingest` with
@@ -31,7 +31,7 @@ HTTP Requests** must be on (it already is). If the server isn't running,
 Studio's sink just retries quietly.
 
 ```sh
-npm test
+bun test
 ```
 
 | env | default | |
@@ -45,7 +45,7 @@ npm test
 ## Live servers (optional, later)
 
 Live Roblox servers can't reach your PC, so logging real players needs this
-server on a **public HTTPS** URL: one always-on Node 22 process with a
+server on a **public HTTPS** URL: one always-on Bun process with a
 persistent disk. The image `ghcr.io/thepotato97/roblox-click-log` (amd64 and
 arm64, built from `main`) runs as user 1000, listens on 8787 and keeps its
 database in `/data`:
@@ -65,16 +65,16 @@ Then:
 ## Analyse journeys
 
 ```sh
-npm run analyze -- --since 24h               # aggregate report + 20 latest journeys
-npm run analyze -- --since 7d --timelines 0  # aggregates only
-npm run analyze -- --user 123456789          # every journey for one player
-npm run analyze -- --json > journeys.json    # raw journeys for your own tooling
-npm run analyze -- --live-only               # leave out Studio playtest rows
+bun run analyze -- --since 24h               # aggregate report + 20 latest journeys
+bun run analyze -- --since 7d --timelines 0  # aggregates only
+bun run analyze -- --user 123456789          # every journey for one player
+bun run analyze -- --json > journeys.json    # raw journeys for your own tooling
+bun run analyze -- --live-only               # leave out Studio playtest rows
 ```
 
-In the container, run the same CLI with `node src/analyze.mjs ...` (it reads
+In the container, run the same CLI with `bun src/analyze.mjs ...` (it reads
 `DB_PATH`, so it finds `/data/clicks.db`), e.g.
-`kubectl exec deploy/click-log -- node src/analyze.mjs --since 7d`.
+`kubectl exec deploy/click-log -- bun src/analyze.mjs --since 7d`.
 
 Or over HTTP: `GET /report?since=7d&timelines=20` returns markdown (add `studio=0` for live-only), and
 `GET /journeys?since=24h&user_id=…&limit=100` returns JSON. Both need
@@ -113,7 +113,7 @@ A **journey** is one player's continuous visit. It ends at `session_ended` or
 after 30 minutes with no events. A `teleported` hop (lobby to game, server
 restart) does not end it.
 
-To have Claude analyse it, run `npm run analyze -- --since 7d` (or fetch
+To have Claude analyse it, run `bun run analyze -- --since 7d` (or fetch
 `/report`) and give it the output. Ask something like "where do new players drop
 off and why?"
 
