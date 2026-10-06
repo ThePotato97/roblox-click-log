@@ -107,6 +107,8 @@ test('ground touches are refused and purged; reads come back per player in time 
     // ...and rows stored before that are purged once, in batches
     db.prepare(`INSERT INTO events (id, at, received_at, user_id, kind, name) VALUES ('pre', ?, 0, 1, 'world', 'touch:Collision')`).run(T0 + 103);
     db.exec('PRAGMA user_version = 0');
+    // reads skip ground rows still waiting for the purge
+    assert.ok(!queryEvents(db, { since: T0 + 100 }).some((e) => e.name === 'touch:Collision'));
     await purgeGround(db, 1);
     const rows = queryEvents(db, { since: T0 + 100 });
     assert.deepEqual(

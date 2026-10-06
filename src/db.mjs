@@ -163,6 +163,10 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
         params.userId = userId;
     }
     if (!includeStudio) where.push('studio = 0');
+    // ground rows can still be on disk until purgeGround finishes; loading
+    // millions of them is what ran a 24h read out of memory
+    where.push(`NOT (kind = 'world' AND name IN (SELECT value FROM json_each($ground)))`);
+    params.ground = JSON.stringify([...GROUND_TAPS]);
     const sql = `SELECT ${READ_COLUMNS} FROM events WHERE ${where.join(' AND ')}`;
     // rows as arrays (values()), copied into plain objects
     const rows = [];
