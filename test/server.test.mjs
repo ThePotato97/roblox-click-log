@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
-import { insertEvents, openDb, queryEvents } from '../src/db.mjs';
+import { insertEvents, openDb, purgeGround, queryEvents } from '../src/db.mjs';
 import { buildJourneys, findRageClicks, report } from '../src/journeys.mjs';
 import { createApp } from '../src/server.mjs';
 
@@ -104,11 +104,10 @@ test('ground touches are refused and purged; reads come back per player in time 
     ]);
     // ground touches are refused on arrival
     assert.deepEqual(insertEvents(db, [ev(3, 106, 'world', 'touch:Collision')]), { accepted: 0, rejected: 1 });
-    // ...and rows stored before that are purged once on open
+    // ...and rows stored before that are purged once, in batches
     db.prepare(`INSERT INTO events (id, at, received_at, user_id, kind, name) VALUES ('pre', ?, 0, 1, 'world', 'touch:Collision')`).run(T0 + 103);
     db.exec('PRAGMA user_version = 0');
-    db.close();
-    db = openDb(join(dir, 'clicks.db'));
+    await purgeGround(db, 1);
     const rows = queryEvents(db, { since: T0 + 100 });
     assert.deepEqual(
         rows.map((e) => [e.user_id, e.at - T0, e.name]),
