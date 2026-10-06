@@ -3,13 +3,24 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { GROUND_TAPS } from './journeys.mjs';
 
 const KINDS = new Set(['button', 'world', 'event']);
 const MAX_ID = 64;
 const MAX_NAME = 200;
 const MAX_SHORT = 100;
 const MAX_PROPS_JSON = 4096;
+// World taps and touches on the map's structure (the invisible floor, the lobby
+// floor, the boundary walls): players tapping to move or a character walking,
+// never interacting with anything. ~85% of what the game sent (touch:Collision
+// alone ~39k an hour), so they're refused at ingest and were purged once.
+const GROUND_TAPS = new Set([
+    'world:Collision',
+    'world:Lobby/floor',
+    'touch:Collision',
+    'touch:Lobby/floor',
+    'touch:InvisibleBackstop',
+    'touch:VisibleWall',
+]);
 
 export function openDb(path) {
     if (path !== ':memory:') {
@@ -40,6 +51,11 @@ export function openDb(path) {
         CREATE INDEX IF NOT EXISTS events_user_at ON events (user_id, at);
         CREATE INDEX IF NOT EXISTS events_at ON events (at);
     `);
+    // one-time purge of ground rows stored before ingest refused them
+    if (db.prepare('PRAGMA user_version').get().user_version < 1) {
+        db.prepare(`DELETE FROM events WHERE kind = 'world' AND name IN (SELECT value FROM json_each(?))`).run(JSON.stringify([...GROUND_TAPS]));
+        db.exec('PRAGMA user_version = 1');
+    }
     return db;
 }
 
@@ -117,7 +133,7 @@ export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
 const READ_COLUMNS = 'at, user_id, session_id, place, kind, name, menu, x, y, value, props';
 
 // Events grouped by player, in time order, optionally filtered. Studio rows are
-// excluded unless asked; ground taps/touches (GROUND_TAPS) always are.
+// excluded unless asked.
 //
 // Rows come off the `at` index in time order and are sorted here. Asking SQLite
 // for ORDER BY user_id, at instead makes it walk events_user_at over the WHOLE
@@ -140,8 +156,6 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
         params.userId = userId;
     }
     if (!includeStudio) where.push('studio = 0');
-    where.push(`NOT (kind = 'world' AND name IN (SELECT value FROM json_each($ground)))`);
-    params.ground = JSON.stringify([...GROUND_TAPS]);
     const sql = `SELECT ${READ_COLUMNS} FROM events WHERE ${where.join(' AND ')}`;
     const statement = db.prepare(sql);
     // rows as arrays, copied into literals: node:sqlite's row objects are

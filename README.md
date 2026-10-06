@@ -92,7 +92,7 @@ The report covers:
   means a button looked clickable but didn't respond (buttons meant to be mashed,
   like the speed upgrade, are listed in `RAGE_IGNORE` in `src/journeys.mjs`)
 - common 3-click sequences
-- ground taps and touches (`GROUND_TAPS` in `src/journeys.mjs`, e.g. the
+- ground taps and touches (`GROUND_TAPS` in `src/db.mjs`, e.g. the
   invisible floor under the map, the boundary walls) are left out of all of it,
   in the SQL query itself: they're players tapping to move or a character
   walking, and outnumber everything else several times over. New ones are

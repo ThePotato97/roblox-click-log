@@ -12,20 +12,6 @@ const RAGE_MIN_CLICKS = 4;
 // against the click target path. The speed upgrade's coin buy button
 // (SpeedUpgrade -> CoinUpgrade) is bought level after level in quick taps.
 const RAGE_IGNORE = [/\/CoinUpgrade\//];
-// World taps and touches on the map's structure (the invisible floor under the
-// map, the lobby floor, the boundary walls): players tapping to move or look, or
-// a character walking around, not trying to interact with anything. Dropped
-// before journeys are built so they don't drown out real world taps. Touches
-// are by far the biggest volume in the log (touch:Collision alone is ~39k an
-// hour), so queryEvents also leaves them out in SQL rather than loading them.
-export const GROUND_TAPS = new Set([
-    'world:Collision',
-    'world:Lobby/floor',
-    'touch:Collision',
-    'touch:Lobby/floor',
-    'touch:InvisibleBackstop',
-    'touch:VisibleWall',
-]);
 const SESSION_EDGES = new Set(['session_started', 'session_ended', 'teleported']);
 
 // 'MainUI/Root/Shop/Items/Card/BuyButton' -> 'MainUI/…/Card/BuyButton': the
@@ -47,7 +33,6 @@ export function buildJourneys(events, gapSeconds = GAP_SECONDS) {
     const journeys = [];
     let current = null;
     for (const event of events) {
-        if (event.kind === 'world' && GROUND_TAPS.has(event.name)) continue;
         const startNew =
             !current ||
             current.userId !== event.user_id ||
