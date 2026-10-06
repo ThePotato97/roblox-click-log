@@ -96,3 +96,47 @@ test('ground taps are dropped, taps on things in the world are kept', () => {
     assert.deepEqual(journey.events.map((e) => e.name), ['world:Drops/GemRegular']);
     assert.equal(journey.clickCount, 1);
 });
+
+test('reads on a file DB run off the main thread, so /health answers mid-report', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'clicklog-'));
+    const dbPath = join(dir, 'clicks.db');
+    const db = openDb(dbPath);
+    // enough rows that building the report takes a noticeable while
+    const many = [];
+    for (let u = 0; u < 400; u++) {
+        for (let i = 0; i < 500; i++) many.push(ev(1000 + u, i, 'button', `Hud/Button${i % 40}`));
+    }
+    for (let i = 0; i < many.length; i += 2000) insertEvents(db, many.slice(i, i + 2000));
+
+    const server = createApp({ db, dbPath, ingestToken: 'secret' }).listen(0);
+    await new Promise((r) => server.once('listening', r));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    try {
+        const order = [];
+        const reportDone = fetch(`${base}/report?since=${T0 - 1}`, { headers: { Authorization: 'Bearer secret' } })
+            .then((r) => r.text())
+            .then((md) => {
+                order.push('report');
+                return md;
+            });
+        await new Promise((r) => setTimeout(r, 50));
+        const health = await fetch(`${base}/health`);
+        order.push('health');
+        assert.equal(health.status, 200);
+        const md = await reportDone;
+        assert.match(md, /# Player journey report/);
+        assert.deepEqual(order, ['health', 'report']);
+
+        const journeys = await (await fetch(`${base}/journeys?since=${T0 - 1}&limit=5`, {
+            headers: { Authorization: 'Bearer secret' },
+        })).json();
+        assert.equal(journeys.length, 5);
+    } finally {
+        server.close();
+        db.close();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
