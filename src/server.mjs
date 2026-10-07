@@ -66,7 +66,7 @@ export function createApp({ db, dbPath = null, ingestToken, readToken = ingestTo
         const url = new URL(req.url, 'http://localhost');
         try {
             if (req.method === 'GET' && url.pathname === '/health') {
-                return send(res, 200, { ok: true });
+                return send(res, 200, { ok: true, image: process.env.IMAGE ?? null });
             }
             if (req.method === 'POST' && url.pathname === '/ingest') {
                 if (!tokenMatches(req.headers.authorization, ingestToken)) return send(res, 401, { error: 'unauthorized' });
