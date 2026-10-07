@@ -22,6 +22,11 @@ export function runRead(db, pathname, query, userBatch = USER_BATCH) {
     } catch (error) {
         return { status: 400, type: 'application/json', body: JSON.stringify({ error: error.message }) };
     }
+    // ?config=key:value keeps journeys that logged that config_exposure, to compare
+    // experiment groups (e.g. config=hud_autohide_moving:true vs :false)
+    const [configKey, configValue] = (query.config ?? '').split(':');
+    const inGroup = (j) =>
+        j.events.some((e) => e.name === 'config_exposure' && e.props?.key === configKey && (configValue === undefined || String(e.props.value) === configValue));
     const filter = { since, until, userIds: userParam ? [Number(userParam)] : null, includeStudio: query.studio !== '0' };
     // players in batches: holding every event in a 24h window at once ran past 2Gi
     const users = readUsers(db, filter);
@@ -33,7 +38,7 @@ export function runRead(db, pathname, query, userBatch = USER_BATCH) {
         // own user_type tag is unreliable (always "Returning").
         const first = firstSeen(db, ids);
         for (const j of journeys) j.userType = first.get(j.userId) >= j.end - j.durationSeconds - 5 ? 'new' : 'returning';
-        return journeys;
+        return configKey ? journeys.filter(inGroup) : journeys;
     };
     if (pathname === '/report') {
         const r = createReport({ timelines: Number(query.timelines ?? 20) });
