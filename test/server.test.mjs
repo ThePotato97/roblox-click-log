@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
-import { insertEvents, openDb, purgeGround, queryEvents } from '../src/db.mjs';
+import { insertEvents, migrateEvents, openDb, queryEvents } from '../src/db.mjs';
 import { buildJourneys, findRageClicks, report } from '../src/journeys.mjs';
 import { createApp } from '../src/server.mjs';
+import { runRead } from '../src/reads.mjs';
 
 const T0 = 1_790_000_000;
 let n = 0;
@@ -76,9 +77,36 @@ test('journeys split on quit and long gaps, and spot rage clicks', () => {
     assert.equal(first.userType, 'new');
     assert.equal(first.clickCount, 6);
     assert.deepEqual(first.rage.map((r) => r.count), [4]);
+    // a session that began before the read window keeps its full length
+    assert.equal(buildJourneys(queryEvents(db, { since: T0 + 5, until: T0 + 100 }))[0].durationSeconds, 60);
     const md = report(journeys, { timelines: 5 });
     assert.match(md, /MainUI\/…\/Card\/BuyButton/);
     assert.match(md, /×4/);
+});
+
+test('new = first seen in the log; bounces get their own exit tables', () => {
+    const db = openDb(':memory:');
+    insertEvents(db, sample());
+    const all = JSON.parse([...runRead(db, '/journeys', { since: String(T0 - 1) }).parts].join(''));
+    assert.deepEqual(all.map((j) => [j.userId, j.userType]), [[1, 'new'], [1, 'returning'], [2, 'new']]);
+    // a later window still knows user 1 played before it
+    const later = JSON.parse([...runRead(db, '/journeys', { since: String(T0 + 3000) }).parts].join(''));
+    assert.deepEqual(later.map((j) => [j.userId, j.userType]), [[1, 'returning']]);
+    const md = runRead(db, '/report', { since: String(T0 - 1) }).body;
+    assert.match(md, /new-player journeys \| 2/);
+    assert.match(md, /journeys under 15s \| 67%/);
+    assert.match(md, /## Exit points, quit within 1 min \(0\)/);
+    assert.match(md, /\| world:sky \| \(quit\) \| 1 \| 100% \|/);
+});
+
+test('batching players changes nothing in the output', () => {
+    const db = openDb(':memory:');
+    insertEvents(db, [...sample(), ev(3, 7, 'button', 'Hud/C'), ev(4, 8, 'button', 'Hud/D'), ev(4, 9, 'event', 'session_ended')]);
+    const q = { since: String(T0 - 1) };
+    const journeys = (query, batch) => [...runRead(db, '/journeys', query, batch).parts].join('');
+    for (const limit of ['2', '3', '100']) assert.equal(journeys({ ...q, limit }, 1), journeys({ ...q, limit }));
+    assert.equal(JSON.parse(journeys({ ...q, limit: '2' }, 1)).length, 2);
+    assert.equal(runRead(db, '/report', q, 1).body, runRead(db, '/report', q).body);
 });
 
 test('mashing the speed upgrade is not rage, mashing a close button is', () => {
@@ -90,38 +118,37 @@ test('mashing the speed upgrade is not rage, mashing a close button is', () => {
     );
 });
 
-test('ground touches are refused and purged; reads come back per player in time order', async () => {
-    const { mkdtempSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const dir = mkdtempSync(join(tmpdir(), 'clicklog-'));
-    let db = openDb(join(dir, 'clicks.db'));
-    insertEvents(db, [
-        ev(2, 105, 'button', 'Hud/B'),
-        ev(1, 102, 'world', 'touch:Teleport/Teleport'),
-        ev(1, 104, 'button', 'Hud/A'),
-        ev(1, 50, 'button', 'Hud/Old'),
-    ]);
+test('old all-text rows migrate into the deduped table; reads cover both until then', async () => {
+    const db = openDb(':memory:');
+    // the pre-dedup table, as an older server left it
+    db.exec(`CREATE TABLE events (id TEXT PRIMARY KEY, at REAL NOT NULL, received_at REAL NOT NULL, user_id INTEGER NOT NULL,
+        session_id TEXT, place TEXT, place_id INTEGER, job_id TEXT, studio INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL,
+        name TEXT NOT NULL, menu TEXT, x REAL, y REAL, value REAL, props TEXT)`);
+    const old = db.prepare(`INSERT INTO events (id, at, received_at, user_id, place, kind, name, props) VALUES (?, ?, 0, ?, 'casual', ?, ?, ?)`);
+    old.run('o1', T0 + 102, 1, 'world', 'touch:Teleport/Teleport', null);
+    old.run('o2', T0 + 103, 1, 'world', 'touch:Collision', null); // ground, never read
+    old.run('o3', T0 + 104, 1, 'button', 'Hud/A', '{"k":1}');
+    insertEvents(db, [ev(2, 105, 'button', 'Hud/B'), ev(1, 50, 'button', 'Hud/Old'), ev(1, 106, 'button', 'Hud/A')]);
     // ground touches are refused on arrival
     assert.deepEqual(insertEvents(db, [ev(3, 106, 'world', 'touch:Collision')]), { accepted: 0, rejected: 1 });
-    // ...and rows stored before that are purged once, in batches
-    db.prepare(`INSERT INTO events (id, at, received_at, user_id, kind, name) VALUES ('pre', ?, 0, 1, 'world', 'touch:Collision')`).run(T0 + 103);
-    db.exec('PRAGMA user_version = 0');
-    await purgeGround(db, 1);
-    const rows = queryEvents(db, { since: T0 + 100 });
-    assert.deepEqual(
-        rows.map((e) => [e.user_id, e.at - T0, e.name]),
-        [
-            [1, 102, 'touch:Teleport/Teleport'],
-            [1, 104, 'Hud/A'],
-            [2, 105, 'Hud/B'],
-        ],
-    );
+    const read = () => queryEvents(db, { since: T0 + 100 }).map((e) => [e.user_id, e.at - T0, e.name, e.place, e.props]);
+    const expected = [
+        [1, 102, 'touch:Teleport/Teleport', 'casual', null],
+        [1, 104, 'Hud/A', 'casual', { k: 1 }],
+        [1, 106, 'Hud/A', 'casual', null],
+        [2, 105, 'Hud/B', 'casual', null],
+    ];
+    assert.deepEqual(read(), expected);
+    await migrateEvents(db, 1);
+    assert.equal(db.query(`SELECT count(*) n FROM sqlite_master WHERE name = 'events'`).get().n, 0);
+    assert.deepEqual(read(), expected);
+    // each text value is stored once however many rows use it
+    assert.equal(db.query(`SELECT count(*) n FROM strings WHERE value = 'Hud/A'`).get().n, 1);
     db.close();
-    rmSync(dir, { recursive: true, force: true });
 });
 
-test('reads on a file DB run off the main thread, so /health answers mid-report', async () => {
+// slow on purpose (it needs a report that takes a while), so past the 5s default
+test('reads on a file DB run off the main thread, so /health answers mid-report', { timeout: 30_000 }, async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -154,10 +181,17 @@ test('reads on a file DB run off the main thread, so /health answers mid-report'
         assert.match(md, /# Player journey report/);
         assert.deepEqual(order, ['health', 'report']);
 
-        const journeys = await (await fetch(`${base}/journeys?since=${T0 - 1}&limit=5`, {
+        // streamed out of the worker in batches of 200
+        const journeys = await (await fetch(`${base}/journeys?since=${T0 - 1}&limit=1000`, {
             headers: { Authorization: 'Bearer secret' },
         })).json();
-        assert.equal(journeys.length, 5);
+        assert.equal(journeys.length, 400);
+        // fetch asks for gzip and inflates it; check it really went out compressed
+        const raw = await fetch(`${base}/journeys?since=${T0 - 1}&limit=1000`, {
+            headers: { Authorization: 'Bearer secret', 'Accept-Encoding': 'gzip' },
+            decompress: false,
+        });
+        assert.equal(raw.headers.get('content-encoding'), 'gzip');
     } finally {
         server.close();
         db.close();

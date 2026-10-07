@@ -25,7 +25,7 @@ const db = openDb(values.db);
 const events = queryEvents(db, {
     since: parseSince(values.since),
     until: parseSince(values.until),
-    userId: values.user ? Number(values.user) : null,
+    userIds: values.user ? [Number(values.user)] : null,
     includeStudio: !values['live-only'],
 });
 const journeys = buildJourneys(events);

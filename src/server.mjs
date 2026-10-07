@@ -9,8 +9,8 @@
 //   READ_TOKEN    bearer token for the read endpoints (default: INGEST_TOKEN)
 import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
-import { gunzipSync } from 'node:zlib';
-import { insertEvents, openDb, purgeGround } from './db.mjs';
+import { createGzip, gunzipSync } from 'node:zlib';
+import { insertEvents, migrateEvents, openDb } from './db.mjs';
 import { readInWorker, runRead } from './reads.mjs';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // after decompression
@@ -24,6 +24,18 @@ function tokenMatches(header, expected) {
     const want = Buffer.from(expected);
     return given.length === want.length && timingSafeEqual(given, want);
 }
+
+// waits for `out` to drain, or for the response to close (then it never will)
+const drainOrClose = (out, res) =>
+    new Promise((resolve) => {
+        const done = () => {
+            out.off('drain', done);
+            res.off('close', done);
+            resolve();
+        };
+        out.on('drain', done);
+        res.on('close', done);
+    });
 
 function send(res, status, body, type = 'application/json') {
     const payload = typeof body === 'string' ? body : JSON.stringify(body);
@@ -67,7 +79,20 @@ export function createApp({ db, dbPath = null, ingestToken, readToken = ingestTo
                 if (!tokenMatches(req.headers.authorization, readToken)) return send(res, 401, { error: 'unauthorized' });
                 const query = Object.fromEntries(url.searchParams);
                 const result = dbPath ? await readInWorker(dbPath, url.pathname, query) : runRead(db, url.pathname, query);
-                return send(res, result.status, result.body, result.type);
+                // gzip when asked: a journey repeats the same names and keys event after
+                // event, so 140MB of JSON goes out as ~13MB
+                const gzip = /\bgzip\b/.test(req.headers['accept-encoding'] ?? '');
+                res.writeHead(result.status, {
+                    'Content-Type': `${result.type}; charset=utf-8`,
+                    ...(gzip && { 'Content-Encoding': 'gzip' }),
+                });
+                const out = gzip ? createGzip() : res;
+                if (gzip) out.pipe(res);
+                for await (const part of result.parts ?? [result.body]) {
+                    if (res.destroyed) break; // client went away; break ends the worker
+                    if (!out.write(part)) await drainOrClose(out, res);
+                }
+                return out.end();
             }
             return send(res, 404, { error: 'not found' });
         } catch (error) {
@@ -91,6 +116,6 @@ if (process.argv[1]?.endsWith('server.mjs')) {
     const db = openDb(dbPath);
     createApp({ db, dbPath, ingestToken, readToken: process.env.READ_TOKEN || undefined }).listen(port, host, () => {
         console.log(`click-log-server listening on http://${host}:${port}`);
-        purgeGround(db).catch((error) => console.error('ground purge failed', error));
+        migrateEvents(db).catch((error) => console.error('events migration failed', error));
     });
 }

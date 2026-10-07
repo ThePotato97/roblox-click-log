@@ -28,44 +28,135 @@ export function openDb(path) {
     }
     // strict: named params bind from plain keys ({ since }) to $since
     const db = new Database(path, { strict: true });
+    // Every repeated text value (event names, session ids, places, menus, kinds,
+    // job ids) is stored once in `strings`; events2 holds its id. In the old
+    // all-text `events` table those repeats were most of the file.
     db.exec(`
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
-        CREATE TABLE IF NOT EXISTS events (
+        PRAGMA busy_timeout = 5000;  -- wait out a reader's checkpoint instead of failing SQLITE_BUSY
+        CREATE TABLE IF NOT EXISTS strings (
+            id    INTEGER PRIMARY KEY,
+            value TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS events2 (
             id          TEXT PRIMARY KEY,
             at          REAL NOT NULL,     -- unix seconds (server-synced clock)
             received_at REAL NOT NULL,
             user_id     INTEGER NOT NULL,
-            session_id  TEXT,              -- per-server session (JobId:UserId:join)
-            place       TEXT,              -- casual | thockland | competitive | lobby
+            session_id  INTEGER,           -- strings.id: per-server session (JobId:UserId:join)
+            place       INTEGER,           -- strings.id: casual | thockland | competitive | lobby
             place_id    INTEGER,
-            job_id      TEXT,
+            job_id      INTEGER,           -- strings.id
             studio      INTEGER NOT NULL DEFAULT 0,
-            kind        TEXT NOT NULL,     -- button | world | event
-            name        TEXT NOT NULL,     -- gui path / world target / event name
-            menu        TEXT,              -- menu open at click time
+            kind        INTEGER NOT NULL,  -- strings.id: button | world | event
+            name        INTEGER NOT NULL,  -- strings.id: gui path / world target / event name
+            menu        INTEGER,           -- strings.id: menu open at click time
             x           REAL,
             y           REAL,
             value       REAL,
             props       TEXT               -- JSON
         );
-        CREATE INDEX IF NOT EXISTS events_user_at ON events (user_id, at);
-        CREATE INDEX IF NOT EXISTS events_at ON events (at);
+        CREATE INDEX IF NOT EXISTS events2_user_at ON events2 (user_id, at);
+        CREATE INDEX IF NOT EXISTS events2_at ON events2 (at);
     `);
     return db;
 }
 
-// One-time purge of ground rows stored before ingest refused them. Runs after
-// the server is listening, a batch at a time, yielding between batches so
-// /health and /ingest keep answering however many rows there are.
-export async function purgeGround(db, batch = 5000) {
-    if (db.prepare('PRAGMA user_version').get().user_version >= 1) return;
-    const del = db.prepare(`DELETE FROM events WHERE rowid IN (
-        SELECT rowid FROM events WHERE kind = 'world' AND name IN (SELECT value FROM json_each(?)) LIMIT ?)`);
-    const names = JSON.stringify([...GROUND_TAPS]);
-    while (del.run(names, batch).changes > 0) await new Promise((r) => setTimeout(r, 0));
-    db.exec('PRAGMA user_version = 1');
+const hasLegacy = (db) => Boolean(db.query(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'`).get());
+
+// string -> strings.id for the writer, cached; dropped on rollback, since a
+// rolled-back id can be handed to a different string next time
+const writeIds = new WeakMap();
+function stringId(db, value) {
+    if (value === null) return null;
+    let ids = writeIds.get(db);
+    if (!ids) writeIds.set(db, (ids = new Map()));
+    let id = ids.get(value);
+    if (id === undefined) {
+        id = db.query('INSERT INTO strings (value) VALUES (?) ON CONFLICT (value) DO UPDATE SET value = value RETURNING id').get(value).id;
+        ids.set(value, id);
+    }
+    return id;
 }
+
+// strings.id -> string for readers. Ids are append-only, so each read only loads
+// strings added since the last one.
+const readStrings = new WeakMap();
+function stringsOf(db) {
+    let strings = readStrings.get(db);
+    if (!strings) readStrings.set(db, (strings = [null]));
+    for (const [id, value] of db.query('SELECT id, value FROM strings WHERE id >= ?').values(strings.length)) strings[id] = value;
+    return strings;
+}
+
+function transaction(db, fn) {
+    db.exec('BEGIN');
+    try {
+        const result = fn();
+        db.exec('COMMIT');
+        return result;
+    } catch (error) {
+        db.exec('ROLLBACK');
+        writeIds.delete(db);
+        throw error;
+    }
+}
+
+const INSERT_SQL = `
+    INSERT OR IGNORE INTO events2
+        (id, at, received_at, user_id, session_id, place, place_id, job_id,
+         studio, kind, name, menu, x, y, value, props)
+    VALUES
+        ($id, $at, $received_at, $user_id, $session_id, $place, $place_id, $job_id,
+         $studio, $kind, $name, $menu, $x, $y, $value, $props)`;
+
+// a cleaned event (or an old-table row) as an events2 row
+const toRow = (db, e) => ({
+    id: e.id,
+    at: e.at,
+    received_at: e.received_at,
+    user_id: e.user_id,
+    session_id: stringId(db, e.session_id),
+    place: stringId(db, e.place),
+    place_id: e.place_id,
+    job_id: stringId(db, e.job_id),
+    studio: e.studio,
+    kind: stringId(db, e.kind),
+    name: stringId(db, e.name),
+    menu: stringId(db, e.menu),
+    x: e.x,
+    y: e.y,
+    value: e.value,
+    props: e.props,
+});
+
+// One-time copy of the old all-text `events` table into events2, run after the
+// server is listening, a batch at a time with a yield between batches so /health
+// and /ingest keep answering. Copied rows stay put until the table is dropped at
+// the end (deleting them as it went was ~1s per 5000 rows of index upkeep);
+// `migrated.upto` is the last copied rowid, and reads skip old rows up to it.
+// Ground rows still waiting for the old purge are dropped on the way.
+// ponytail: the dropped table's pages are reused by new rows rather than given
+// back to the volume; VACUUM if the file itself ever needs to shrink.
+export async function migrateEvents(db, batch = 5000) {
+    if (!hasLegacy(db)) return;
+    db.exec('CREATE TABLE IF NOT EXISTS migrated (upto INTEGER NOT NULL); INSERT INTO migrated SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM migrated)');
+    const pick = db.query('SELECT rowid AS rid, * FROM events WHERE rowid > ? ORDER BY rowid LIMIT ?');
+    const insert = db.query(INSERT_SQL);
+    const mark = db.query('UPDATE migrated SET upto = ?');
+    for (let rows; (rows = pick.all(migratedUpto(db), batch)).length; ) {
+        transaction(db, () => {
+            for (const r of rows) if (!(r.kind === 'world' && GROUND_TAPS.has(r.name))) insert.run(toRow(db, r));
+            mark.run(rows.at(-1).rid);
+        });
+        await new Promise((r) => setTimeout(r, 0));
+    }
+    db.exec('DROP TABLE events; DROP TABLE migrated');
+}
+
+const migratedUpto = (db) => db.query(`SELECT upto FROM migrated`).get()?.upto ?? 0;
+const hasMigrated = (db) => Boolean(db.query(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migrated'`).get());
 
 const str = (value, max) => (typeof value === 'string' ? value.slice(0, max) : null);
 const num = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : null);
@@ -108,46 +199,26 @@ export function cleanEvent(raw, receivedAt) {
 // Insert a batch in one transaction. Duplicate ids (a game server retrying a
 // batch it thinks failed) are ignored. Returns { accepted, rejected }.
 export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
-    const insert = db.prepare(`
-        INSERT OR IGNORE INTO events
-            (id, at, received_at, user_id, session_id, place, place_id, job_id,
-             studio, kind, name, menu, x, y, value, props)
-        VALUES
-            ($id, $at, $received_at, $user_id, $session_id, $place, $place_id, $job_id,
-             $studio, $kind, $name, $menu, $x, $y, $value, $props)
-    `);
+    const insert = db.query(INSERT_SQL);
     let accepted = 0;
     let rejected = 0;
-    db.exec('BEGIN');
-    try {
+    transaction(db, () => {
         for (const raw of rawEvents) {
             const event = cleanEvent(raw, receivedAt);
             if (!event) {
                 rejected++;
                 continue;
             }
-            accepted += Number(insert.run(event).changes);
+            accepted += Number(insert.run(toRow(db, event)).changes);
         }
-        db.exec('COMMIT');
-    } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-    }
+    });
     return { accepted, rejected };
 }
 
-// Columns a journey reads. received_at, place_id, job_id, studio and id are
-// write-side bookkeeping, and every extra column costs a JS property per row.
-const READ_COLUMNS = 'at, user_id, session_id, place, kind, name, menu, x, y, value, props';
-
-// Events grouped by player, in time order, optionally filtered. Studio rows are
-// excluded unless asked.
-//
-// Rows come off the `at` index in time order and are sorted here. Asking SQLite
-// for ORDER BY user_id, at instead makes it walk events_user_at over the WHOLE
-// table and fetch every row by rowid at random to apply the time filter, which
-// is what made a 1h report take 11s.
-export function queryEvents(db, { since = null, until = null, userId = null, includeStudio = false } = {}) {
+// The WHERE clause shared by the read queries. Studio rows are excluded unless
+// asked. Pass `legacy` (the db) when reading the old all-text table, which can
+// still hold ground rows and rows the migration already copied.
+function readFilter({ since = null, until = null, userIds = null, includeStudio = false }, legacy = null) {
     const where = [];
     const params = {};
     if (since !== null) {
@@ -158,17 +229,95 @@ export function queryEvents(db, { since = null, until = null, userId = null, inc
         where.push('at < $until');
         params.until = until;
     }
-    if (userId !== null) {
-        where.push('user_id = $userId');
-        params.userId = userId;
+    if (userIds !== null) {
+        where.push('user_id IN (SELECT value FROM json_each($userIds))');
+        params.userIds = JSON.stringify(userIds);
     }
     if (!includeStudio) where.push('studio = 0');
-    const sql = `SELECT ${READ_COLUMNS} FROM events WHERE ${where.join(' AND ')}`;
-    // rows as arrays (values()), copied into plain objects
+    if (legacy) {
+        // rows the migration already copied into events2
+        where.push('rowid > $upto');
+        params.upto = hasMigrated(legacy) ? migratedUpto(legacy) : 0;
+        where.push(`NOT (kind = 'world' AND name IN (SELECT value FROM json_each($ground)))`);
+        params.ground = JSON.stringify([...GROUND_TAPS]);
+    }
+    return { where: where.join(' AND ') || '1', params };
+}
+
+// Players with events in the window, ascending, so reads can work through them a
+// batch at a time instead of holding every event in the window at once.
+export function readUsers(db, filter = {}) {
+    const users = new Set();
+    for (const table of hasLegacy(db) ? ['events2', 'events'] : ['events2']) {
+        const { where, params } = readFilter(filter, table === 'events' ? db : null);
+        for (const [id] of db.query(`SELECT DISTINCT user_id FROM ${table} WHERE ${where}`).values(params)) users.add(id);
+    }
+    return [...users].sort((a, b) => a - b);
+}
+
+// Columns a journey reads. received_at, place_id, job_id and id are write-side
+// bookkeeping, and every extra column costs a JS property per row.
+const READ_COLUMNS = 'at, user_id, session_id, place, kind, name, menu, x, y, value, props';
+
+// Events grouped by player, in time order, optionally filtered to some players.
+// Without `userIds` rows come off the `at` index in time order and are sorted here
+// (ORDER BY user_id, at walks the user index over the WHOLE table, which made a
+// 1h report take 11s); with them each player is one user index seek. Rows are
+// streamed, and every name/session/place is one shared string.
+export function queryEvents(db, filter = {}) {
     const rows = [];
-    for (const [at, user_id, session_id, place, kind, name, menu, x, y, value, props] of db.prepare(sql).values(params)) {
-        rows.push({ at, user_id, session_id, place, kind, name, menu, x, y, value, props: props ? JSON.parse(props) : null });
+    const strings = stringsOf(db);
+    const text = (id) => (id === null ? null : strings[id]);
+    const { where, params } = readFilter(filter);
+    for (const r of db.query(`SELECT ${READ_COLUMNS} FROM events2 WHERE ${where}`).iterate(params)) {
+        rows.push({
+            at: r.at,
+            user_id: r.user_id,
+            session_id: text(r.session_id),
+            place: text(r.place),
+            kind: text(r.kind),
+            name: text(r.name),
+            menu: text(r.menu),
+            x: r.x,
+            y: r.y,
+            value: r.value,
+            props: r.props ? JSON.parse(r.props) : null,
+        });
+    }
+    if (hasLegacy(db)) {
+        const seen = new Map();
+        const intern = (v) => (v === null ? v : (seen.get(v) ?? (seen.set(v, v), v)));
+        const legacy = readFilter(filter, db);
+        for (const r of db.query(`SELECT ${READ_COLUMNS} FROM events WHERE ${legacy.where}`).iterate(legacy.params)) {
+            rows.push({
+                at: r.at,
+                user_id: r.user_id,
+                session_id: intern(r.session_id),
+                place: intern(r.place),
+                kind: intern(r.kind),
+                name: intern(r.name),
+                menu: intern(r.menu),
+                x: r.x,
+                y: r.y,
+                value: r.value,
+                props: r.props ? JSON.parse(r.props) : null,
+            });
+        }
     }
     // stable sort; every plan yields same-time rows in rowid order
     return rows.sort((a, b) => a.user_id - b.user_id || a.at - b.at);
+}
+
+// Each player's first event anywhere in the log, for telling new players from
+// returning ones. One min() per player and table: SQLite answers each with a
+// single user-index seek, which an IN + GROUP BY (or a studio filter) would lose.
+export function firstSeen(db, userIds) {
+    const tables = hasLegacy(db) ? ['events2', 'events'] : ['events2'];
+    const stmts = tables.map((t) => db.query(`SELECT min(at) AS at FROM ${t} WHERE user_id = ?`));
+    return new Map(
+        [...userIds].map((id) => {
+            const ats = stmts.map((s) => s.get(id).at).filter((at) => at !== null);
+            return [id, ats.length ? Math.min(...ats) : null];
+        }),
+    );
 }
