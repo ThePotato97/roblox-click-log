@@ -77,7 +77,7 @@ In the container, run the same CLI with `bun src/analyze.mjs ...` (it reads
 `kubectl exec deploy/click-log -- bun src/analyze.mjs --since 7d`.
 
 Or over HTTP: `GET /report?since=7d&timelines=20` returns markdown (add `studio=0` for live-only), and
-`GET /journeys?since=24h&user_id=…&limit=100` returns JSON. Both need
+`GET /journeys?since=24h&user_id=…&limit=100` returns JSON. Add `config=key:value` (e.g. `hud_autohide_moving:true`) to either to keep only journeys that logged that config exposure, for comparing experiment groups. Both need
 `Authorization: Bearer <READ_TOKEN>`.
 
 The report covers:

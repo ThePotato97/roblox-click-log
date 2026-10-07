@@ -198,3 +198,15 @@ test('reads on a file DB run off the main thread, so /health answers mid-report'
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+test('?config=key:value keeps only journeys in that experiment group', () => {
+    const db = openDb(':memory:');
+    const exposure = (userId, value) => ev(userId, 1, 'event', 'config_exposure', { props: { key: 'hud_autohide_moving', value } });
+    insertEvents(db, [...sample(), exposure(1, true), exposure(2, false)]);
+    const users = (config) =>
+        JSON.parse([...runRead(db, '/journeys', { since: String(T0 - 1), config }).parts].join('')).map((j) => j.userId);
+    assert.deepEqual(users('hud_autohide_moving:true'), [1]);
+    assert.deepEqual(users('hud_autohide_moving:false'), [2]);
+    assert.deepEqual(users('hud_autohide_moving'), [1, 2]);
+    assert.match(runRead(db, '/report', { since: String(T0 - 1), config: 'hud_autohide_moving:false' }).body, /journeys \| 1 \|/);
+});
