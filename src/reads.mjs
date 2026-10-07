@@ -114,6 +114,7 @@ export function readInWorker(dbPath, pathname, query) {
 
 if (!isMainThread && workerData?.dbPath) {
     const db = new Database(workerData.dbPath, { readonly: true, strict: true });
+    db.exec('PRAGMA busy_timeout = 5000');
     const { parts, ...head } = runRead(db, workerData.pathname, workerData.query);
     if (!parts) {
         parentPort.postMessage(head);

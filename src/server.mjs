@@ -10,7 +10,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createGzip, gunzipSync } from 'node:zlib';
-import { insertEvents, openDb, purgeGround } from './db.mjs';
+import { insertEvents, migrateEvents, openDb } from './db.mjs';
 import { readInWorker, runRead } from './reads.mjs';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // after decompression
@@ -116,6 +116,6 @@ if (process.argv[1]?.endsWith('server.mjs')) {
     const db = openDb(dbPath);
     createApp({ db, dbPath, ingestToken, readToken: process.env.READ_TOKEN || undefined }).listen(port, host, () => {
         console.log(`click-log-server listening on http://${host}:${port}`);
-        purgeGround(db).catch((error) => console.error('ground purge failed', error));
+        migrateEvents(db).catch((error) => console.error('events migration failed', error));
     });
 }

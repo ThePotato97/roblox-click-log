@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
-import { insertEvents, openDb, purgeGround, queryEvents } from '../src/db.mjs';
+import { insertEvents, migrateEvents, openDb, queryEvents } from '../src/db.mjs';
 import { buildJourneys, findRageClicks, report } from '../src/journeys.mjs';
 import { createApp } from '../src/server.mjs';
 import { runRead } from '../src/reads.mjs';
@@ -118,40 +118,37 @@ test('mashing the speed upgrade is not rage, mashing a close button is', () => {
     );
 });
 
-test('ground touches are refused and purged; reads come back per player in time order', async () => {
-    const { mkdtempSync, rmSync } = await import('node:fs');
-    const { tmpdir } = await import('node:os');
-    const { join } = await import('node:path');
-    const dir = mkdtempSync(join(tmpdir(), 'clicklog-'));
-    let db = openDb(join(dir, 'clicks.db'));
-    insertEvents(db, [
-        ev(2, 105, 'button', 'Hud/B'),
-        ev(1, 102, 'world', 'touch:Teleport/Teleport'),
-        ev(1, 104, 'button', 'Hud/A'),
-        ev(1, 50, 'button', 'Hud/Old'),
-    ]);
+test('old all-text rows migrate into the deduped table; reads cover both until then', async () => {
+    const db = openDb(':memory:');
+    // the pre-dedup table, as an older server left it
+    db.exec(`CREATE TABLE events (id TEXT PRIMARY KEY, at REAL NOT NULL, received_at REAL NOT NULL, user_id INTEGER NOT NULL,
+        session_id TEXT, place TEXT, place_id INTEGER, job_id TEXT, studio INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL,
+        name TEXT NOT NULL, menu TEXT, x REAL, y REAL, value REAL, props TEXT)`);
+    const old = db.prepare(`INSERT INTO events (id, at, received_at, user_id, place, kind, name, props) VALUES (?, ?, 0, ?, 'casual', ?, ?, ?)`);
+    old.run('o1', T0 + 102, 1, 'world', 'touch:Teleport/Teleport', null);
+    old.run('o2', T0 + 103, 1, 'world', 'touch:Collision', null); // ground, never read
+    old.run('o3', T0 + 104, 1, 'button', 'Hud/A', '{"k":1}');
+    insertEvents(db, [ev(2, 105, 'button', 'Hud/B'), ev(1, 50, 'button', 'Hud/Old'), ev(1, 106, 'button', 'Hud/A')]);
     // ground touches are refused on arrival
     assert.deepEqual(insertEvents(db, [ev(3, 106, 'world', 'touch:Collision')]), { accepted: 0, rejected: 1 });
-    // ...and rows stored before that are purged once, in batches
-    db.prepare(`INSERT INTO events (id, at, received_at, user_id, kind, name) VALUES ('pre', ?, 0, 1, 'world', 'touch:Collision')`).run(T0 + 103);
-    db.exec('PRAGMA user_version = 0');
-    // reads skip ground rows still waiting for the purge
-    assert.ok(!queryEvents(db, { since: T0 + 100 }).some((e) => e.name === 'touch:Collision'));
-    await purgeGround(db, 1);
-    const rows = queryEvents(db, { since: T0 + 100 });
-    assert.deepEqual(
-        rows.map((e) => [e.user_id, e.at - T0, e.name]),
-        [
-            [1, 102, 'touch:Teleport/Teleport'],
-            [1, 104, 'Hud/A'],
-            [2, 105, 'Hud/B'],
-        ],
-    );
+    const read = () => queryEvents(db, { since: T0 + 100 }).map((e) => [e.user_id, e.at - T0, e.name, e.place, e.props]);
+    const expected = [
+        [1, 102, 'touch:Teleport/Teleport', 'casual', null],
+        [1, 104, 'Hud/A', 'casual', { k: 1 }],
+        [1, 106, 'Hud/A', 'casual', null],
+        [2, 105, 'Hud/B', 'casual', null],
+    ];
+    assert.deepEqual(read(), expected);
+    await migrateEvents(db, 1);
+    assert.equal(db.query(`SELECT count(*) n FROM sqlite_master WHERE name = 'events'`).get().n, 0);
+    assert.deepEqual(read(), expected);
+    // each text value is stored once however many rows use it
+    assert.equal(db.query(`SELECT count(*) n FROM strings WHERE value = 'Hud/A'`).get().n, 1);
     db.close();
-    rmSync(dir, { recursive: true, force: true });
 });
 
-test('reads on a file DB run off the main thread, so /health answers mid-report', async () => {
+// slow on purpose (it needs a report that takes a while), so past the 5s default
+test('reads on a file DB run off the main thread, so /health answers mid-report', { timeout: 30_000 }, async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
