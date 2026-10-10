@@ -1,11 +1,11 @@
 {
   "name": "click-log-server",
   "private": true,
-  "description": "Stores ColorFillGame click journeys in SQLite and reports on them",
+  "description": "Stores ColorFillGame click journeys in ClickHouse and reports on them",
   "type": "module",
   "scripts": {
     "start": "bun src/server.mjs",
     "analyze": "bun src/analyze.mjs",
-    "test": "npx -y bun@1.4.2 test"
+    "test": "sh test/run.sh"
   }
 }
