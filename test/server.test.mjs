@@ -267,3 +267,39 @@ test('raw events expire, the rollup and first-seen survive it', () => {
     assert.equal(firstSeen(db, [1]).get(1), T0); // player 1's raw events are gone, their first visit isn't
     assert.match(runRead(db, '/rollup', { since: String(T0 - 3600) }).body, /\| UI:Opened:Chaos \| 1 \| 1 \|/);
 });
+
+test('a batch landing after its hour was rolled up is redone before its raw rows expire', () => {
+    const db = openDb(':memory:');
+    const H = Math.ceil(T0 / 3600) * 3600 - T0;
+    insertEvents(db, [ev(1, H + 1, 'event', 'UI:Opened:Chaos')], T0 + H + 2);
+    rollupPending(db, T0 + H + 3600 + 600);
+    const prompt = ev(1, H + 2, 'event', 'Purchase:PromptOpened', { props: { name: 'TacticalNuke_1', price: 540 } });
+    insertEvents(db, [prompt], T0 + H + 7200); // late: its hour already closed
+    assert.equal(expireEvents(db, T0 + H + 99_999), 0); // expiry waits for the redo
+    assert.equal(rollupPending(db, T0 + H + 7200), 1);
+    expireEvents(db, T0 + H + 99_999);
+    assert.match(runRead(db, '/rollup', { since: String(T0) }).body, /\| TacticalNuke_1@540 \| 1 \| 0 \| 0 \| 1 \|/);
+});
+
+test('a retry of a batch events2 already took is not stored twice', () => {
+    const db = openDb(':memory:');
+    db.exec(`INSERT INTO strings (id, value) VALUES (1, 'event'), (2, 'Purchase:PromptFinished')`);
+    db.exec(`INSERT INTO events2 (id, at, received_at, user_id, studio, kind, name) VALUES ('old1', ${T0}, ${T0}, 1, 0, 1, 2)`);
+    assert.deepEqual(insertEvents(db, [{ id: 'old1', at: T0, user_id: 1, kind: 'event', name: 'Purchase:PromptFinished' }]), { accepted: 0, rejected: 0 });
+    assert.equal(queryEvents(db).length, 1);
+});
+
+test('?match hides rows but keeps each step\'s shares out of all its transitions', () => {
+    const db = openDb(':memory:');
+    const H = Math.ceil(T0 / 3600) * 3600 - T0;
+    const events = [];
+    for (let u = 1; u <= 10; u++) {
+        events.push(ev(u, H + 1, 'event', 'UI:Opened:Menu'));
+        events.push(u === 1 ? ev(u, H + 2, 'event', 'Purchase:PromptOpened') : ev(u, H + 2, 'event', 'session_ended'));
+    }
+    insertEvents(db, events, T0 + H + 3);
+    rollupPending(db, T0 + H + 3600 + 600);
+    const read = (query) => runRead(db, '/rollup', { since: String(T0), ...query }).body;
+    assert.match(read({}), /\| UI:Opened:Menu \| Purchase:PromptOpened \| 1 \| 10\.0% \|/);
+    assert.match(read({ match: 'Purchase' }), /\| UI:Opened:Menu \| Purchase:PromptOpened \| 1 \| 10\.0% \|/);
+});

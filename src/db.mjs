@@ -90,6 +90,9 @@ export function openDb(path) {
             user_id  INTEGER PRIMARY KEY,
             first_at REAL NOT NULL
         );
+        -- closed hours that got events after they closed: the rollup redoes them
+        -- (and expiry waits for it), so a late batch isn't lost with its raw rows
+        CREATE TABLE IF NOT EXISTS late_hours (hour INTEGER PRIMARY KEY);
     `);
     return db;
 }
@@ -237,6 +240,9 @@ export function cleanEvent(raw, receivedAt) {
 // batch it thinks failed) are ignored. Returns { accepted, rejected }.
 export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
     const insert = db.query(INSERT_SQL);
+    const late = db.query('INSERT OR IGNORE INTO late_hours (hour) VALUES (?)');
+    // while events2 still holds rows, a retry of a batch it took must not land twice
+    const inOld = hasTable(db, 'events2') ? db.query('SELECT 1 FROM events2 WHERE id = ?') : null;
     let accepted = 0;
     let rejected = 0;
     transaction(db, () => {
@@ -246,7 +252,11 @@ export function insertEvents(db, rawEvents, receivedAt = Date.now() / 1000) {
                 rejected++;
                 continue;
             }
-            accepted += Number(insert.run(toRow(db, event)).changes);
+            if (inOld?.get(event.id)) continue;
+            if (!Number(insert.run(toRow(db, event)).changes)) continue;
+            accepted++;
+            const hour = Math.floor(event.at / 3600) * 3600;
+            if (hour + 3600 <= receivedAt) late.run(hour);
         }
     });
     return { accepted, rejected };
@@ -377,6 +387,8 @@ export function firstEventAt(db) {
 // shortcut: freed pages are reused by new rows, not given back to the volume; VACUUM
 // once if the file itself needs to shrink.
 export function expireEvents(db, before, batch = 5000) {
+    // never past an hour the rollup still has to redo
+    before = Math.min(before, db.query('SELECT min(hour) AS hour FROM late_hours').get().hour ?? Infinity);
     let deleted = 0;
     for (const table of eventTables(db).filter((t) => t !== 'events')) {
         db.query(

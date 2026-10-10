@@ -93,9 +93,10 @@ export function rollupHour(db, hour) {
         rows.push({ user: events[i].user_id, ...summarise(events.slice(i, j)) });
         i = j;
     }
-    const insert = db.query('INSERT OR REPLACE INTO rollup2 (hour, user_id, configs, data) VALUES (?, ?, ?, ?)');
+    const insert = db.query('INSERT INTO rollup2 (hour, user_id, configs, data) VALUES (?, ?, ?, ?)');
     db.exec('BEGIN');
     try {
+        db.query('DELETE FROM rollup2 WHERE hour = ?').run(hour);
         for (const r of rows) insert.run(hour, r.user, r.configs && JSON.stringify(r.configs), deflateSync(JSON.stringify(r.data)));
         db.query('INSERT OR IGNORE INTO rollup2_hours (hour) VALUES (?)').run(hour);
         db.exec('COMMIT');
@@ -107,9 +108,17 @@ export function rollupHour(db, hour) {
 }
 
 // Rolls up every closed hour not done yet, oldest first (the first run backfills
-// the whole log). Returns how many hours it did.
+// the whole log), and redoes hours that got late events. Returns how many hours it did.
 export function rollupPending(db, now = Date.now() / 1000) {
     openRollup(db);
+    // un-done each late hour before reading it: an event landing mid-rollup marks
+    // it again, and a crash leaves it pending rather than marked done
+    for (const [hour] of db.query('SELECT hour FROM late_hours WHERE hour + ? <= ?').values(HOUR + GRACE_SECONDS, now)) {
+        db.exec('BEGIN');
+        db.query('DELETE FROM late_hours WHERE hour = ?').run(hour);
+        db.query('DELETE FROM rollup2_hours WHERE hour = ?').run(hour);
+        db.exec('COMMIT');
+    }
     const first = firstEventAt(db);
     if (first === null) return 0;
     const done = new Set(db.query('SELECT hour FROM rollup2_hours').values().map(([h]) => h));
@@ -244,14 +253,14 @@ export function readRollup(db, query) {
     if (path.length >= MAX_PATH) throw new SyntaxError(`path can be at most ${MAX_PATH - 1} steps`);
     const prefix = path.join('\t');
     const rows = [];
-    const totals = new Map();
+    const totals = new Map(); // every way out of a step, counted before ?match hides any
     for (const [k, v] of edges) {
         const steps = k.split('\t');
         if (steps.length !== Math.max(path.length, 1) + 1) continue;
-        if (path.length ? !k.startsWith(`${prefix}\t`) : !(keep(steps[0]) || keep(steps[1]))) continue;
+        if (path.length && !k.startsWith(`${prefix}\t`)) continue;
         const from = steps.slice(0, -1).join(' > ');
-        rows.push([from, steps.at(-1), v]);
         totals.set(from, (totals.get(from) ?? 0) + v);
+        if (path.length || keep(steps[0]) || keep(steps[1])) rows.push([from, steps.at(-1), v]);
     }
     out.push(`## Transitions${path.length ? ` after ${path.join(' > ')}` : ''}`, '');
     out.push(
