@@ -5,6 +5,7 @@ import { insertEvents, migrateEvents, openDb, queryEvents } from '../src/db.mjs'
 import { buildJourneys, findRageClicks, report } from '../src/journeys.mjs';
 import { createApp } from '../src/server.mjs';
 import { runRead } from '../src/reads.mjs';
+import { rollupPending } from '../src/rollup.mjs';
 
 const T0 = 1_790_000_000;
 let n = 0;
@@ -209,4 +210,46 @@ test('?config=key:value keeps only journeys in that experiment group', () => {
     assert.deepEqual(users('hud_autohide_moving:false'), [2]);
     assert.deepEqual(users('hud_autohide_moving'), [1, 2]);
     assert.match(runRead(db, '/report', { since: String(T0 - 1), config: 'hud_autohide_moving:false' }).body, /journeys \| 1 \|/);
+});
+
+test('rollup: closed hours summarise once per player and /rollup adds them up by group', () => {
+    const db = openDb(':memory:');
+    const H = Math.ceil(T0 / 3600) * 3600 - T0; // offset of the first hour boundary after T0
+    const exposure = (userId, at, value) => ev(userId, at, 'event', 'config_exposure', { props: { key: 'chaos_catalog', value } });
+    const prompt = (userId, at, purchased) => [
+        ev(userId, at, 'event', 'Purchase:PromptOpened', { props: { name: 'TacticalNuke_1', price: 540 } }),
+        ev(userId, at + 1, 'event', 'Purchase:PromptFinished', { props: { name: 'TacticalNuke_1', price: 540, purchased } }),
+    ];
+    insertEvents(db, [
+        exposure(1, H + 1, 'power'),
+        ev(1, H + 2, 'event', 'UI:Opened:Chaos'),
+        ev(1, H + 3, 'button', 'React/Menus/Container/Content/Cards/TacticalNuke/Catcher'),
+        ...prompt(1, H + 4, false),
+        ev(1, H + 10, 'event', 'session_ended'),
+        // player 1 again next hour, no new exposure: still power
+        ev(1, H + 3700, 'event', 'UI:Opened:Chaos'),
+        ev(1, H + 3701, 'button', 'React/Menus/Container/ExitButton'),
+        exposure(2, H + 1, 'disasters'),
+        ev(2, H + 2, 'event', 'UI:Opened:Chaos'),
+        ...prompt(2, H + 4, true),
+        // the open hour: not rolled up yet
+        ev(3, H + 7300, 'event', 'UI:Opened:Chaos'),
+    ]);
+    const now = T0 + H + 7200 + 600; // hour 2 closed past the grace, hour 3 still open
+    assert.equal(rollupPending(db, now), 2);
+    assert.equal(rollupPending(db, now), 0); // done hours are skipped
+
+    const read = (query) => runRead(db, '/rollup', { since: String(T0), ...query }).body;
+    const power = read({ config: 'chaos_catalog:power' });
+    assert.match(power, /\| players \| 1 \|/);
+    assert.match(power, /\| UI:Opened:Chaos \| 2 \| 1 \| 100\.0% \|/);
+    assert.match(power, /\| TacticalNuke_1@540 \| 1 \| 0 \| 1 \| 1 \|/);
+    assert.match(power, /\| click React\/Menus\/Container\/Content\/Cards\/TacticalNuke\/Catcher \| Purchase:PromptOpened \| 1 \|/);
+    assert.match(power, /\| Purchase:PromptFinished \| \(quit\) \| 1 \|/);
+    assert.match(read({ config: 'chaos_catalog:disasters' }), /\| TacticalNuke_1@540 \| 1 \| 1 \| 0 \| 1 \|/);
+    const out = read({ from: 'UI:Opened:Chaos' });
+    assert.match(out, /\| players \| 2 \|/); // player 3's hour isn't in yet
+    assert.match(out, /\| UI:Opened:Chaos \| click React\/Menus\/Container\/ExitButton \| 1 \|/);
+    assert.doesNotMatch(out, /\| click React\/Menus\/Container\/Content\/Cards\/TacticalNuke\/Catcher \| Purchase/);
+    assert.equal(runRead(db, '/rollup', { match: '(' }).status, 400);
 });

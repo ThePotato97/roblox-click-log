@@ -8,12 +8,22 @@ import { Worker, isMainThread, parentPort, workerData } from 'node:worker_thread
 import { Database } from 'bun:sqlite';
 import { firstSeen, queryEvents, readUsers } from './db.mjs';
 import { buildJourneys, createReport, parseSince } from './journeys.mjs';
+import { readRollup } from './rollup.mjs';
 
 const USER_BATCH = 500;
 
 // Returns { status, type, body } for a read request. `query` is the URL's searchParams
 // as a plain object so it can cross the thread boundary.
 export function runRead(db, pathname, query, userBatch = USER_BATCH) {
+    if (pathname === '/rollup') {
+        try {
+            return { status: 200, type: 'text/markdown', body: readRollup(db, query) };
+        } catch (error) {
+            // a bad since/until or match regex
+            if (!(error instanceof SyntaxError) && !/can't read time/.test(error.message)) throw error;
+            return { status: 400, type: 'application/json', body: JSON.stringify({ error: error.message }) };
+        }
+    }
     const userParam = query.user_id;
     let since, until;
     try {

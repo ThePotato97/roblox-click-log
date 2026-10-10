@@ -12,6 +12,7 @@ import { createServer } from 'node:http';
 import { createGzip, gunzipSync } from 'node:zlib';
 import { insertEvents, migrateEvents, openDb } from './db.mjs';
 import { readInWorker, runRead } from './reads.mjs';
+import { openRollup, rollupInWorker } from './rollup.mjs';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // after decompression
 const MAX_EVENTS_PER_REQUEST = 2000;
@@ -75,7 +76,7 @@ export function createApp({ db, dbPath = null, ingestToken, readToken = ingestTo
                 if (!events || events.length > MAX_EVENTS_PER_REQUEST) return send(res, 400, { error: 'expected { events: [...] }' });
                 return send(res, 200, insertEvents(db, events));
             }
-            if (req.method === 'GET' && (url.pathname === '/report' || url.pathname === '/journeys')) {
+            if (req.method === 'GET' && ['/report', '/journeys', '/rollup'].includes(url.pathname)) {
                 if (!tokenMatches(req.headers.authorization, readToken)) return send(res, 401, { error: 'unauthorized' });
                 const query = Object.fromEntries(url.searchParams);
                 const result = dbPath ? await readInWorker(dbPath, url.pathname, query) : runRead(db, url.pathname, query);
@@ -114,8 +115,13 @@ if (process.argv[1]?.endsWith('server.mjs')) {
     }
     const dbPath = process.env.DB_PATH ?? './data/clicks.db';
     const db = openDb(dbPath);
+    openRollup(db);
     createApp({ db, dbPath, ingestToken, readToken: process.env.READ_TOKEN || undefined }).listen(port, host, () => {
         console.log(`click-log-server listening on http://${host}:${port}`);
         migrateEvents(db).catch((error) => console.error('events migration failed', error));
+        // roll up closed hours: the first run backfills the whole log
+        const rollup = () => rollupInWorker(dbPath).catch((error) => console.error('rollup failed', error));
+        rollup();
+        setInterval(rollup, 5 * 60 * 1000);
     });
 }
