@@ -40,7 +40,7 @@ function windowOf(query, defaultSince) {
     params.ckey = key ?? '';
     params.cvalue = value ?? '';
     params.anyValue = value === undefined;
-    return { where: where.join(' AND '), params, since, until };
+    return { where: where.join(' AND '), params };
 }
 
 const IS_EXPOSURE = `kind = 'event' AND name = 'config_exposure' AND JSONExtractString(props, 'key') = {ckey:String}`;
