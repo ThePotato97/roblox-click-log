@@ -77,7 +77,8 @@ In the container, run the same CLI with `bun src/analyze.mjs ...` (it reads
 `kubectl exec deploy/click-log -- bun src/analyze.mjs --since 7d`.
 
 Or over HTTP: `GET /report?since=7d&timelines=20` returns markdown (add `studio=0` for live-only), and
-`GET /journeys?since=24h&user_id=…&limit=100` returns JSON. Add `config=key:value` (e.g. `hud_autohide_moving:true`) to either to keep only journeys that logged that config exposure, for comparing experiment groups.
+`GET /journeys?since=24h&user_id=…&limit=100` returns JSON. Add `config=key:value` (e.g. `hud_autohide_moving:true`) to either to keep only journeys that logged that config exposure, for comparing experiment groups. Both need
+`Authorization: Bearer <READ_TOKEN>`.
 
 For anything over a few hours, use `GET /rollup` instead. Both of the others rebuild every journey in the window on each request, so a multi-day read runs past Cloudflare's 100s and comes back 524. The server rolls each closed hour up once (10 min after it closes; the first start backfills the whole log) into one row per player: how often they took each step, step → next-step transitions, purchase prompts and their config exposures. `/rollup` adds those rows up, so days take seconds. Markdown, same token:
 
@@ -89,8 +90,7 @@ For anything over a few hours, use `GET /rollup` instead. Both of the others reb
 | `from` | | one exact step, e.g. `UI:Opened:Chaos`: only the transitions out of it |
 | `limit` | `40` | rows per table |
 
-Steps are event names, `click <full button path>` and world targets (full paths, unlike the report's shortened ones). Both need
-`Authorization: Bearer <READ_TOKEN>`.
+Steps are event names, `click <full button path>` and world targets (full paths, unlike the report's shortened ones).
 
 The report covers:
 
