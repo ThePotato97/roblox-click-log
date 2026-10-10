@@ -58,13 +58,14 @@ async function readBody(req) {
     return JSON.parse(body.toString('utf8'));
 }
 
-export function createApp({ db, ingestToken, readToken = ingestToken }) {
+// `isReady` gates /health, so the pod takes no traffic until ClickHouse has the table
+export function createApp({ db, ingestToken, readToken = ingestToken, isReady = () => true }) {
     if (!ingestToken) throw new Error('INGEST_TOKEN is required');
     return createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
         try {
             if (req.method === 'GET' && url.pathname === '/health') {
-                return send(res, 200, { ok: true, image: process.env.IMAGE ?? null });
+                return send(res, isReady() ? 200 : 503, { ok: isReady(), image: process.env.IMAGE ?? null });
             }
             if (req.method === 'POST' && url.pathname === '/ingest') {
                 if (!tokenMatches(req.headers.authorization, ingestToken)) return send(res, 401, { error: 'unauthorized' });
@@ -96,7 +97,7 @@ export function createApp({ db, ingestToken, readToken = ingestToken }) {
         } catch (error) {
             // ClickHouse down or refusing: 503, so the game's sink keeps the batch and retries
             const status = error.status ?? (error instanceof SyntaxError ? 400 : error.clickhouse || error.code === 'ConnectionRefused' ? 503 : 500);
-            if (status >= 500) console.error(error);
+            if (status >= 500) console.error(error.clickhouse ? error.message : error);
             if (res.headersSent) return res.destroy();
             return send(res, status, { error: status >= 500 ? 'internal error' : error.message });
         }
@@ -113,10 +114,15 @@ if (process.argv[1]?.endsWith('server.mjs')) {
         process.exit(1);
     }
     const db = openDb();
-    // ClickHouse can still be starting (it's a sidecar); /ingest answers 503 until then
-    const init = () => db.init().catch((error) => (console.error('clickhouse not ready', error.message), setTimeout(init, 5000)));
+    // ClickHouse can still be starting (it's a sidecar): /health is 503 until it has the table
+    let ready = false;
+    const init = () =>
+        db.init().then(
+            () => (ready = true),
+            (error) => (console.error('clickhouse not ready:', error.message), setTimeout(init, 2000)),
+        );
     init();
-    createApp({ db, ingestToken, readToken: process.env.READ_TOKEN || undefined }).listen(port, host, () => {
+    createApp({ db, ingestToken, readToken: process.env.READ_TOKEN || undefined, isReady: () => ready }).listen(port, host, () => {
         console.log(`click-log-server listening on http://${host}:${port}`);
     });
 }

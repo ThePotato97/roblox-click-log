@@ -56,9 +56,9 @@ const read = async (db, path, query) => {
 };
 const journeys = async (db, query) => JSON.parse((await read(db, '/journeys', query)).body);
 
-async function withServer(fn, db) {
+async function withServer(fn, db, isReady) {
     db ??= await freshDb();
-    const server = createApp({ db, ingestToken: 'secret' }).listen(0);
+    const server = createApp({ db, ingestToken: 'secret', isReady }).listen(0);
     await new Promise((r) => server.once('listening', r));
     try {
         await fn(`http://127.0.0.1:${server.address().port}`, db);
@@ -103,7 +103,8 @@ test('ingest answers 503 while ClickHouse is unreachable, so the game retries', 
             body: JSON.stringify({ events: sample() }),
         });
         assert.equal(res.status, 503);
-    }, db);
+        assert.equal((await fetch(`${base}/health`)).status, 503); // no traffic until it's back
+    }, db, () => false);
 });
 
 test('journeys split on quit and long gaps, and spot rage clicks', async () => {
