@@ -7,6 +7,8 @@ import {
     GAP_SECONDS, RAGE_IGNORE, RAGE_MIN_CLICKS, RAGE_WINDOW_SECONDS, buildJourneys, fmtClock, fmtDate, parseSince, pct, table, timeline,
 } from './journeys.mjs';
 
+// events per slice when building the journey table (see journeyTable)
+const SLICE_ROWS = 1_000_000;
 // bounce cut-offs, shortest first
 const BOUNCES = [['15s', 15], ['1 min', 60], ['3 min', 180]];
 
@@ -56,10 +58,10 @@ const SHORT = `if(kind = 'button' AND length(splitByChar('/', name)) > 4,
 // `full` labels buttons by their whole path (/paths) instead of the shortened one.
 // The config group is per journey (it logged the exposure), or with `byPlayer`
 // the player's last exposure in the window.
-async function journeyTable(db, session, w, { full = false, byPlayer = false } = {}) {
+async function journeyTable(db, session, w, { full = false, byPlayer = false, sliceRows = SLICE_ROWS } = {}) {
     const lbl = full ? `if(kind = 'button', concat('click ', name), name)` : `if(kind = 'button', concat('click ', short), short)`;
-    await db.exec(
-        `CREATE TEMPORARY TABLE jr ENGINE = MergeTree ORDER BY (user_id, start) AS
+    // the select below for one slice of players; `w.where` inside it is the slice's
+    const select = (w) => `
         WITH
             e AS (
                 SELECT *, sum(brk) OVER (PARTITION BY user_id ORDER BY at, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS jn
@@ -100,9 +102,24 @@ async function journeyTable(db, session, w, { full = false, byPlayer = false } =
         FROM j LEFT JOIN (
             SELECT user_id, min(toUnixTimestamp64Milli(at)) / 1000 AS first FROM events
             WHERE user_id IN (SELECT user_id FROM events WHERE ${w.where}) GROUP BY user_id
-        ) AS f USING user_id`,
-        { session, params: w.params },
-    );
+        ) AS f USING user_id`;
+    // Holding a whole window's journeys at once ran ClickHouse out of memory (~1.5GB
+    // per 4M events), so the table is filled a slice of players at a time. Slices
+    // are user_id ranges, which the sort key reads straight off disk.
+    const [{ n }] = await db.rows(`SELECT count() AS n FROM events WHERE ${w.where}`, { params: w.params });
+    const slices = Math.max(1, Math.ceil(n / sliceRows));
+    const bounds = slices > 1 ? (await db.rows(
+        `SELECT quantilesExact(${Array.from({ length: slices - 1 }, (_, i) => (i + 1) / slices).join(', ')})(user_id) AS q
+        FROM events WHERE ${w.where}`,
+        { params: w.params },
+    ))[0].q : [];
+    const edges = [null, ...new Set(bounds), null];
+    await db.exec(`CREATE TEMPORARY TABLE jr ENGINE = MergeTree ORDER BY (user_id, start) EMPTY AS ${select(w)}`, { session, params: w.params });
+    for (let i = 0; i + 1 < edges.length; i++) {
+        const range = [edges[i] !== null && `user_id > ${edges[i]}`, edges[i + 1] !== null && `user_id <= ${edges[i + 1]}`].filter(Boolean);
+        const slice = { ...w, where: [w.where, ...range].join(' AND ') };
+        await db.exec(`INSERT INTO jr ${select(slice)}`, { session, params: w.params });
+    }
 }
 
 // Rows of events as buildJourneys wants them, read line by line off the response.
@@ -167,8 +184,8 @@ async function picks(db, session, sql) {
     return new Map(rows.map((r) => [`${r.user_id}@${r.start}`, r.is_new]));
 }
 
-async function report(db, session, w, query) {
-    await journeyTable(db, session, w);
+async function report(db, session, w, query, opts) {
+    await journeyTable(db, session, w, opts);
     const q = (sql) => db.rows(sql, { session });
     const [o] = await q(
         `SELECT count() AS nJourneys, uniqExact(user_id) AS players, countIf(ended) AS nEnded, countIf(is_new) AS nNew,
@@ -287,7 +304,7 @@ const transitions = (q, limit, cond = '1', steps = 'steps') =>
 
 // /paths: Umami/Rybbit-style path analysis over full step names. A player's group
 // is their last exposure to the config key in the window.
-async function paths(db, session, w, query) {
+async function paths(db, session, w, query, opts) {
     const limit = count(query.limit, 40, 1000) || 40;
     let match = '';
     if (query.match) {
@@ -301,7 +318,7 @@ async function paths(db, session, w, query) {
     }
     const path = (query.path ?? query.from ?? '').split('>').filter(Boolean);
     if (path.length > 3) throw badRequest('path takes at most 3 steps');
-    await journeyTable(db, session, w, { full: true, byPlayer: true });
+    await journeyTable(db, session, w, { ...opts, full: true, byPlayer: true });
     const q = (sql) => db.rows(sql, { session, params: w.params });
     const [o] = await q(`SELECT uniqExact(user_id) AS players, count() AS journeys, min(start) AS lo, max(end) AS hi FROM jr WHERE in_group`);
     const players = o.players;
@@ -356,8 +373,8 @@ async function paths(db, session, w, query) {
     return out.join('\n');
 }
 
-async function journeys(db, session, w, query) {
-    await journeyTable(db, session, w);
+async function journeys(db, session, w, query, opts) {
+    await journeyTable(db, session, w, opts);
     // the newest `limit`, then in player and time order
     const limit = count(query.limit, 100, 10_000_000);
     const picked = `SELECT user_id, start, end, is_new FROM jr WHERE in_group ORDER BY start DESC, user_id LIMIT ${limit}`;
@@ -376,13 +393,14 @@ async function journeys(db, session, w, query) {
 
 // Returns { status, type, body } or { status, type, parts } for a read request;
 // `query` is the URL's searchParams as a plain object.
-export async function runRead(db, pathname, query) {
+// `opts.sliceRows` is for tests
+export async function runRead(db, pathname, query, opts = {}) {
     // temporary tables live in a session; one per request
     const session = randomUUID();
     try {
-        if (pathname === '/report') return { status: 200, type: 'text/markdown', body: await report(db, session, windowOf(query, '7d'), query) };
-        if (pathname === '/paths') return { status: 200, type: 'text/markdown', body: await paths(db, session, windowOf(query, '24h'), query) };
-        return { status: 200, type: 'application/json', parts: await journeys(db, session, windowOf(query, '7d'), query) };
+        if (pathname === '/report') return { status: 200, type: 'text/markdown', body: await report(db, session, windowOf(query, '7d'), query, opts) };
+        if (pathname === '/paths') return { status: 200, type: 'text/markdown', body: await paths(db, session, windowOf(query, '24h'), query, opts) };
+        return { status: 200, type: 'application/json', parts: await journeys(db, session, windowOf(query, '7d'), query, opts) };
     } catch (error) {
         if (error.status !== 400) throw error;
         return { status: 400, type: 'application/json', body: JSON.stringify({ error: error.message }) };
