@@ -1,40 +1,45 @@
-// Journey analysis CLI: reads the click-log SQLite file directly and prints the
-// markdown report (or JSON journeys) -- the thing to hand Claude when asking
-// "what are players doing?".
+// Journey analysis CLI: the same reads as the HTTP endpoints, straight off
+// ClickHouse (CLICKHOUSE_* env, see db.mjs). Prints the markdown report, or
+// /paths, or JSON journeys -- the thing to hand Claude when asking "what are
+// players doing?".
 //
-//   node src/analyze.mjs [--db ./data/clicks.db] [--since 7d] [--until ...]
-//                        [--user <userId>] [--timelines 20] [--live-only] [--json]
+//   bun src/analyze.mjs [--since 7d] [--until ...] [--user <userId>] [--timelines 20]
+//                       [--config key:value] [--live-only] [--json] [--paths [--path a>b]]
 import { parseArgs } from 'node:util';
-import { openDb, queryEvents } from './db.mjs';
-import { buildJourneys, parseSince, report, timeline } from './journeys.mjs';
+import { openDb } from './db.mjs';
+import { runRead } from './reads.mjs';
 
 const { values } = parseArgs({
     options: {
-        db: { type: 'string', default: process.env.DB_PATH ?? './data/clicks.db' },
         since: { type: 'string', default: '7d' },
         until: { type: 'string' },
         user: { type: 'string' },
         timelines: { type: 'string', default: '20' },
+        config: { type: 'string' },
         // Studio playtest rows are included unless asked otherwise
         'live-only': { type: 'boolean', default: false },
         json: { type: 'boolean', default: false },
+        paths: { type: 'boolean', default: false },
+        path: { type: 'string' },
+        match: { type: 'string' },
+        limit: { type: 'string' },
     },
 });
 
-const db = openDb(values.db);
-const events = queryEvents(db, {
-    since: parseSince(values.since),
-    until: parseSince(values.until),
-    userIds: values.user ? [Number(values.user)] : null,
-    includeStudio: !values['live-only'],
-});
-const journeys = buildJourneys(events);
-
-if (values.json) {
-    console.log(JSON.stringify(journeys, null, 2));
-} else if (values.user) {
-    // one player: every journey in full, oldest first
-    console.log(journeys.map(timeline).join('\n\n') || 'No events for that user in range.');
-} else {
-    console.log(report(journeys, { timelines: Number(values.timelines) }));
-}
+const query = Object.fromEntries(
+    Object.entries({
+        since: values.since,
+        until: values.until,
+        user_id: values.user,
+        timelines: values.timelines,
+        config: values.config,
+        studio: values['live-only'] ? '0' : undefined,
+        path: values.path,
+        match: values.match,
+        limit: values.limit ?? (values.json ? '1000000' : undefined),
+    }).filter(([, v]) => v !== undefined),
+);
+const result = await runRead(openDb(), values.json ? '/journeys' : values.paths ? '/paths' : '/report', query);
+if (result.parts) for await (const part of result.parts) process.stdout.write(part);
+else process.stdout.write(result.body);
+process.stdout.write('\n');

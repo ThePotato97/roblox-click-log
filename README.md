@@ -12,16 +12,20 @@ ClickLogController (client)  every GuiButton activation + world tap, batched eve
 ClickLogSink (game server)   + every design event, funnel step, session start/end/teleport
         │ HttpService POST /ingest, gzip, every 10s
         ▼
-click-log-server (this)      SQLite (data/clicks.db)  →  /report, /journeys, analyze CLI
+click-log-server (this)      ClickHouse  →  /report, /paths, /journeys, analyze CLI
 ```
 
-There are no dependencies. It runs on **Bun** (1.4+) and uses its built-in
-`bun:sqlite` plus `node:http`.
+There are no dependencies. It runs on **Bun** (1.4+) and talks to
+**ClickHouse** over its HTTP interface. Every event is kept, compressed in
+columns; journeys, paths and the report are computed in SQL when you read them
+(the way Umami and Rybbit do it), so a week reads in seconds and nothing has to
+be rolled up or expired.
 
 ## Run it locally (Studio playtests)
 
 ```sh
-bun start          # http://127.0.0.1:8787, data in ./data/clicks.db
+clickhouse server  # or any ClickHouse on 127.0.0.1:8123 (https://clickhouse.com/docs/install)
+bun start          # http://127.0.0.1:8787
 ```
 
 Then press Play in Studio. Studio sends to `http://localhost:8787/ingest` with
@@ -31,14 +35,17 @@ HTTP Requests** must be on (it already is). If the server isn't running,
 Studio's sink just retries quietly.
 
 ```sh
-bun test
+npm test           # starts a throwaway ClickHouse in Docker
+CLICKHOUSE_URL=http://127.0.0.1:8123 npm test   # or uses yours (each test makes its own database)
 ```
 
 | env | default | |
 | --- | --- | --- |
 | `HOST` | `127.0.0.1` | `0.0.0.0` to expose it; then `INGEST_TOKEN` is required |
 | `PORT` | `8787` | |
-| `DB_PATH` | `./data/clicks.db` | |
+| `CLICKHOUSE_URL` | `http://127.0.0.1:8123` | |
+| `CLICKHOUSE_DB` | `clicklog` | created on start, with its `events` table |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `default` / empty | |
 | `INGEST_TOKEN` | `local-dev` on loopback | bearer token the game sends |
 | `READ_TOKEN` | `INGEST_TOKEN` | bearer token for `/report` and `/journeys` |
 
@@ -46,13 +53,18 @@ bun test
 
 Live Roblox servers can't reach your PC, so logging real players needs this
 server on a **public HTTPS** URL: one always-on Bun process with a
-persistent disk. The image `ghcr.io/thepotato97/roblox-click-log` (amd64 and
-arm64, built from `main`) runs as user 1000, listens on 8787 and keeps its
-database in `/data`:
+ClickHouse beside it. The image `ghcr.io/thepotato97/roblox-click-log` (amd64
+and arm64, built from `main`) runs as user 1000 and listens on 8787:
 
 ```sh
-docker run -p 8787:8787 -v click-log:/data -e INGEST_TOKEN=... ghcr.io/thepotato97/roblox-click-log:main
+docker run -p 8787:8787 -e INGEST_TOKEN=... -e CLICKHOUSE_URL=http://clickhouse:8123 ghcr.io/thepotato97/roblox-click-log:main
 ```
+
+If ClickHouse is down, `/ingest` answers 503 and the game's sink keeps the batch
+and retries.
+
+To move an old SQLite log (`clicks.db`) over, once: `bun src/migrate.mjs /data/clicks.db`.
+Rerunning it is harmless.
 
 Then:
 
@@ -67,30 +79,34 @@ Then:
 ```sh
 bun run analyze -- --since 24h               # aggregate report + 20 latest journeys
 bun run analyze -- --since 7d --timelines 0  # aggregates only
-bun run analyze -- --user 123456789          # every journey for one player
-bun run analyze -- --json > journeys.json    # raw journeys for your own tooling
+bun run analyze -- --paths --config chaos_catalog:power --path UI:Opened:Chaos
+bun run analyze -- --user 123456789 --json   # every journey for one player
 bun run analyze -- --live-only               # leave out Studio playtest rows
 ```
 
-In the container, run the same CLI with `bun src/analyze.mjs ...` (it reads
-`DB_PATH`, so it finds `/data/clicks.db`), e.g.
-`kubectl exec deploy/click-log -- bun src/analyze.mjs --since 7d`.
+In the cluster: `kubectl exec deploy/click-log -c app -- bun src/analyze.mjs --since 7d`.
 
-Or over HTTP: `GET /report?since=7d&timelines=20` returns markdown (add `studio=0` for live-only), and
-`GET /journeys?since=24h&user_id=…&limit=100` returns JSON. Add `config=key:value` (e.g. `hud_autohide_moving:true`) to either to keep only journeys that logged that config exposure, for comparing experiment groups. Both need
-`Authorization: Bearer <READ_TOKEN>`.
+Or over HTTP, with `Authorization: Bearer <READ_TOKEN>`:
 
-For anything over a few hours, use `GET /rollup` instead. Both of the others rebuild every journey in the window on each request, so a multi-day read runs past Cloudflare's 100s and comes back 524. The server rolls each closed hour up once (10 min after it closes; the first start backfills the whole log) into one row per player: how often they took each step, step → next-step transitions, purchase prompts and their config exposures. `/rollup` adds those rows up, so days take seconds. Markdown, same token:
-
-| param | | |
+| endpoint | returns | |
 | --- | --- | --- |
-| `since`, `until` | `24h` | rounded down to the hour; the current hour isn't in yet |
-| `config` | everyone | `key:value`; a player's group is their last exposure to `key` in the window |
-| `match` | | regex (case-insensitive) on step names, e.g. `Chaos\|Nuke` |
-| `from` | | one exact step, e.g. `UI:Opened:Chaos`: only the transitions out of it |
-| `limit` | `40` | rows per table |
+| `GET /report` | markdown | the report below; `timelines=20` |
+| `GET /paths` | markdown | steps, purchase prompts, and transitions or what follows a path |
+| `GET /journeys` | JSON | the newest `limit` (100) journeys in full; `user_id=` for one player |
 
-Steps are event names, `click <full button path>` and world targets (full paths, unlike the report's shortened ones).
+All three take `since` (default `7d`, `24h` for `/paths`) and `until` (`24h`, `7d`,
+`30m`, an ISO date or unix seconds), `studio=0` for live-only, and
+`config=key:value` (e.g. `hud_autohide_moving:true`; `key` alone for anyone exposed)
+to compare experiment groups. For `/report` and `/journeys` a journey is in the
+group if it logged that exposure; for `/paths` a player is, by their last exposure
+in the window.
+
+`/paths` also takes `match` (case-insensitive regex on step names, e.g.
+`Chaos|Nuke`), `path` (1-3 exact steps joined by `>`, e.g.
+`UI:Opened:Chaos>click React/…/Cards/TacticalNuke/Catcher`: what came next after
+them, `(quit)` or `(end of window)` included) and `limit` (40 rows). Its steps are
+event names, `click <full button path>` and world targets (full paths, unlike the
+report's shortened ones).
 
 The report covers:
 
@@ -105,10 +121,9 @@ The report covers:
   like the speed upgrade, are listed in `RAGE_IGNORE` in `src/journeys.mjs`)
 - common 3-click sequences
 - ground taps and touches (`GROUND_TAPS` in `src/db.mjs`, e.g. the
-  invisible floor under the map, the boundary walls) are left out of all of it,
-  in the SQL query itself: they're players tapping to move or a character
-  walking, and outnumber everything else several times over. New ones are
-  refused at ingest (counted as `rejected`); older rows are skipped by the query.
+  invisible floor under the map, the boundary walls) are refused at ingest
+  (counted as `rejected`): they're players tapping to move or a character
+  walking, and outnumber everything else several times over.
 - per-journey timelines like this:
 
 ```
@@ -125,12 +140,13 @@ A **journey** is one player's continuous visit. It ends at `session_ended` or
 after 30 minutes with no events. A `teleported` hop (lobby to game, server
 restart) does not end it.
 
-To have Claude analyse it, run `bun run analyze -- --since 7d` (or fetch
-`/report`) and give it the output. Ask something like "where do new players drop
+To have Claude analyse it, fetch `/report` or `/paths` (or run the CLI) and give
+it the output. Ask something like "where do new players drop
 off and why?"
 
 ## Data
 
 Rows hold raw Roblox **UserIds**. That's what makes per-player journeys possible.
 Mixpanel gets a salted hash instead, so treat this database as private and keep
-`READ_TOKEN` secret. Retries are de-duplicated by the event's id.
+`READ_TOKEN` secret. A retried batch is accepted again and its copies dropped in
+storage (`ReplacingMergeTree` on player, time and event id; reads use `FINAL`).

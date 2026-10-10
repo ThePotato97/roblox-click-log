@@ -3,16 +3,15 @@
 //
 //   HOST          bind address (default 127.0.0.1: local only; 0.0.0.0 to expose)
 //   PORT          listen port (default 8787)
-//   DB_PATH       SQLite file (default ./data/clicks.db)
+//   CLICKHOUSE_*  where the events live (see db.mjs)
 //   INGEST_TOKEN  the game's `click_log_token` secret; defaults to 'local-dev'
 //                 (what Studio sends) and is REQUIRED when HOST is not loopback
 //   READ_TOKEN    bearer token for the read endpoints (default: INGEST_TOKEN)
 import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createGzip, gunzipSync } from 'node:zlib';
-import { insertEvents, migrateEvents, openDb } from './db.mjs';
-import { readInWorker, runRead } from './reads.mjs';
-import { openRollup, rollupInWorker } from './rollup.mjs';
+import { insertEvents, openDb } from './db.mjs';
+import { runRead } from './reads.mjs';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // after decompression
 const MAX_EVENTS_PER_REQUEST = 2000;
@@ -59,9 +58,7 @@ async function readBody(req) {
     return JSON.parse(body.toString('utf8'));
 }
 
-// `dbPath` (a file) moves the read endpoints off the main thread; without it (the
-// in-memory test DB, which a worker can't see) they run inline.
-export function createApp({ db, dbPath = null, ingestToken, readToken = ingestToken }) {
+export function createApp({ db, ingestToken, readToken = ingestToken }) {
     if (!ingestToken) throw new Error('INGEST_TOKEN is required');
     return createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
@@ -74,12 +71,12 @@ export function createApp({ db, dbPath = null, ingestToken, readToken = ingestTo
                 const body = await readBody(req);
                 const events = Array.isArray(body?.events) ? body.events : null;
                 if (!events || events.length > MAX_EVENTS_PER_REQUEST) return send(res, 400, { error: 'expected { events: [...] }' });
-                return send(res, 200, insertEvents(db, events));
+                return send(res, 200, await insertEvents(db, events));
             }
-            if (req.method === 'GET' && ['/report', '/journeys', '/rollup'].includes(url.pathname)) {
+            if (req.method === 'GET' && ['/report', '/journeys', '/paths'].includes(url.pathname)) {
                 if (!tokenMatches(req.headers.authorization, readToken)) return send(res, 401, { error: 'unauthorized' });
                 const query = Object.fromEntries(url.searchParams);
-                const result = dbPath ? await readInWorker(dbPath, url.pathname, query) : runRead(db, url.pathname, query);
+                const result = await runRead(db, url.pathname, query);
                 // gzip when asked: a journey repeats the same names and keys event after
                 // event, so 140MB of JSON goes out as ~13MB
                 const gzip = /\bgzip\b/.test(req.headers['accept-encoding'] ?? '');
@@ -90,16 +87,18 @@ export function createApp({ db, dbPath = null, ingestToken, readToken = ingestTo
                 const out = gzip ? createGzip() : res;
                 if (gzip) out.pipe(res);
                 for await (const part of result.parts ?? [result.body]) {
-                    if (res.destroyed) break; // client went away; break ends the worker
+                    if (res.destroyed) break; // client went away; break cancels the query
                     if (!out.write(part)) await drainOrClose(out, res);
                 }
                 return out.end();
             }
             return send(res, 404, { error: 'not found' });
         } catch (error) {
-            const status = error.status ?? (error instanceof SyntaxError ? 400 : 500);
-            if (status === 500) console.error(error);
-            return send(res, status, { error: status === 500 ? 'internal error' : error.message });
+            // ClickHouse down or refusing: 503, so the game's sink keeps the batch and retries
+            const status = error.status ?? (error instanceof SyntaxError ? 400 : error.clickhouse || error.code === 'ConnectionRefused' ? 503 : 500);
+            if (status >= 500) console.error(error);
+            if (res.headersSent) return res.destroy();
+            return send(res, status, { error: status >= 500 ? 'internal error' : error.message });
         }
     });
 }
@@ -113,15 +112,11 @@ if (process.argv[1]?.endsWith('server.mjs')) {
         console.error('INGEST_TOKEN is required when HOST is not loopback');
         process.exit(1);
     }
-    const dbPath = process.env.DB_PATH ?? './data/clicks.db';
-    const db = openDb(dbPath);
-    openRollup(db);
-    createApp({ db, dbPath, ingestToken, readToken: process.env.READ_TOKEN || undefined }).listen(port, host, () => {
+    const db = openDb();
+    // ClickHouse can still be starting (it's a sidecar); /ingest answers 503 until then
+    const init = () => db.init().catch((error) => (console.error('clickhouse not ready', error.message), setTimeout(init, 5000)));
+    init();
+    createApp({ db, ingestToken, readToken: process.env.READ_TOKEN || undefined }).listen(port, host, () => {
         console.log(`click-log-server listening on http://${host}:${port}`);
-        migrateEvents(db).catch((error) => console.error('events migration failed', error));
-        // roll up closed hours: the first run backfills the whole log
-        const rollup = () => rollupInWorker(dbPath).catch((error) => console.error('rollup failed', error));
-        rollup();
-        setInterval(rollup, 5 * 60 * 1000);
     });
 }
