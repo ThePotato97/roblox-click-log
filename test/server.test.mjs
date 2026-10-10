@@ -47,8 +47,8 @@ after(async () => {
 });
 
 const since = { since: String(T0 - 1) };
-const read = async (db, path, query) => {
-    const r = await runRead(db, path, { ...since, ...query });
+const read = async (db, path, query, opts) => {
+    const r = await runRead(db, path, { ...since, ...query }, opts);
     if (!r.parts) return r;
     let body = '';
     for await (const part of r.parts) body += part;
@@ -144,6 +144,9 @@ test('the SQL report matches what the journeys say', async () => {
     assert.match(md, /\| world:sky \| \(quit\) \| 1 \| 100% \|/);
     assert.match(md, /## Journeys \(4 most recent of 4\)/);
     assert.match(md, /### Journey 1@1790000000 — user 1 \(new\)/);
+    // built a few players at a time, the answer is the same
+    assert.equal((await read(db, '/report', { timelines: '5' }, { sliceRows: 3 })).body, md);
+    for (const path of ['/paths', '/journeys']) assert.equal((await read(db, path, {}, { sliceRows: 3 })).body, (await read(db, path)).body);
 });
 
 test('mashing the speed upgrade is not rage, mashing a close button is', () => {
