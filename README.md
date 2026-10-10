@@ -80,6 +80,18 @@ Or over HTTP: `GET /report?since=7d&timelines=20` returns markdown (add `studio=
 `GET /journeys?since=24h&user_id=…&limit=100` returns JSON. Add `config=key:value` (e.g. `hud_autohide_moving:true`) to either to keep only journeys that logged that config exposure, for comparing experiment groups. Both need
 `Authorization: Bearer <READ_TOKEN>`.
 
+For anything over a few hours, use `GET /rollup` instead. Both of the others rebuild every journey in the window on each request, so a multi-day read runs past Cloudflare's 100s and comes back 524. The server rolls each closed hour up once (10 min after it closes; the first start backfills the whole log) into one row per player: how often they took each step, step → next-step transitions, purchase prompts and their config exposures. `/rollup` adds those rows up, so days take seconds. Markdown, same token:
+
+| param | | |
+| --- | --- | --- |
+| `since`, `until` | `24h` | rounded down to the hour; the current hour isn't in yet |
+| `config` | everyone | `key:value`; a player's group is their last exposure to `key` in the window |
+| `match` | | regex (case-insensitive) on step names, e.g. `Chaos\|Nuke` |
+| `from` | | one exact step, e.g. `UI:Opened:Chaos`: only the transitions out of it |
+| `limit` | `40` | rows per table |
+
+Steps are event names, `click <full button path>` and world targets (full paths, unlike the report's shortened ones).
+
 The report covers:
 
 - overview: players, journeys, how many ended in a quit, median length, and the
