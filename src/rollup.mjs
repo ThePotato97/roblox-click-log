@@ -3,30 +3,40 @@
 // a lookup instead of rebuilding every journey in the window (which ran past
 // Cloudflare's 100s and came back 524). Raw /journeys stays for one-off digging.
 //
-// One row per (hour, player): counts of every step they took, step -> next-step
-// edges (Sankey data), purchase prompts and their config exposures. Per player, so
-// unique-player counts and ?config groups stay exact over any window.
+// One row per (hour, player): counts of every step they took, the 2-, 3- and
+// 4-step sequences they walked (Sankey data, a layer per ?path step), purchase
+// prompts and their config exposures. Per player, so unique-player counts and
+// ?config groups stay exact over any window.
+//
+// Raw events expire after RETENTION_DAYS; the rollup is kept forever. A change to
+// what a row holds therefore only reaches hours whose raw events still exist: bump
+// the table names (rollup3...) to rebuild those.
 import { Worker, isMainThread, workerData } from 'node:worker_threads';
 import { deflateSync, inflateSync } from 'node:zlib';
 import { Database } from 'bun:sqlite';
-import { queryEvents } from './db.mjs';
+import { expireEvents, firstEventAt, queryEvents } from './db.mjs';
 import { parseSince } from './journeys.mjs';
 
 const HOUR = 3600;
 // an hour is rolled up this long after it closes, so late batches still land in it
 const GRACE_SECONDS = 10 * 60;
 const SESSION_EDGES = new Set(['session_started', 'session_ended', 'teleported']);
+const RETENTION_DAYS = Number(process.env.RETENTION_DAYS ?? 14);
+const MAX_PATH = 4;
 
 export function openRollup(db) {
     db.exec(`
-        CREATE TABLE IF NOT EXISTS rollup (
+        CREATE TABLE IF NOT EXISTS rollup2 (
             hour    INTEGER NOT NULL,   -- unix seconds, start of the hour
             user_id INTEGER NOT NULL,
             configs TEXT,               -- JSON {key: value}, last exposure in the hour
-            data    BLOB NOT NULL,      -- deflated JSON { n, e, b }
+            data    BLOB NOT NULL,      -- deflated JSON { n, e, b }; e keys are 2-4 steps joined by tabs
             PRIMARY KEY (hour, user_id)
         ) WITHOUT ROWID;
-        CREATE TABLE IF NOT EXISTS rollup_hours (hour INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS rollup2_hours (hour INTEGER PRIMARY KEY);
+        -- first version: transitions only, rebuilt as rollup2
+        DROP TABLE IF EXISTS rollup;
+        DROP TABLE IF EXISTS rollup_hours;
     `);
 }
 
@@ -38,17 +48,27 @@ function summarise(events) {
     const e = {};
     const b = {};
     let configs = null;
-    // shortcut: an edge whose two steps fall either side of an hour boundary is
-    // dropped (one per player-hour at most); carry the last step over if it matters
-    let prev = null;
+    // shortcut: a sequence that straddles an hour boundary is dropped (a few per
+    // player-hour at most); carry the last steps over if it matters
+    let recent = []; // the last MAX_PATH steps, repeats folded
+    const walk = (s) => {
+        recent.push(s);
+        if (recent.length > MAX_PATH) recent.shift();
+        for (let len = 2; len <= recent.length; len++) {
+            const k = recent.slice(-len).join('\t');
+            e[k] = (e[k] ?? 0) + 1;
+        }
+    };
     for (const ev of events) {
         if (ev.kind === 'event' && ev.name === 'config_exposure') {
             if (ev.props?.key !== undefined) (configs ??= {})[ev.props.key] = ev.props.value;
             continue;
         }
         if (ev.kind === 'event' && SESSION_EDGES.has(ev.name)) {
-            if (ev.name === 'session_ended' && prev !== null) e[`${prev}\t(quit)`] = (e[`${prev}\t(quit)`] ?? 0) + 1;
-            if (ev.name === 'session_ended') prev = null;
+            if (ev.name === 'session_ended') {
+                if (recent.length) walk('(quit)');
+                recent = [];
+            }
             continue;
         }
         const s = step(ev);
@@ -59,9 +79,7 @@ function summarise(events) {
             if (ev.name === 'Purchase:PromptOpened') p[0]++;
             else p[ev.props?.purchased ? 1 : 2]++;
         }
-        if (s === prev) continue;
-        if (prev !== null) e[`${prev}\t${s}`] = (e[`${prev}\t${s}`] ?? 0) + 1;
-        prev = s;
+        if (s !== recent.at(-1)) walk(s);
     }
     return { configs, data: { n, e, b } };
 }
@@ -75,11 +93,11 @@ export function rollupHour(db, hour) {
         rows.push({ user: events[i].user_id, ...summarise(events.slice(i, j)) });
         i = j;
     }
-    const insert = db.query('INSERT OR REPLACE INTO rollup (hour, user_id, configs, data) VALUES (?, ?, ?, ?)');
+    const insert = db.query('INSERT OR REPLACE INTO rollup2 (hour, user_id, configs, data) VALUES (?, ?, ?, ?)');
     db.exec('BEGIN');
     try {
         for (const r of rows) insert.run(hour, r.user, r.configs && JSON.stringify(r.configs), deflateSync(JSON.stringify(r.data)));
-        db.query('INSERT OR IGNORE INTO rollup_hours (hour) VALUES (?)').run(hour);
+        db.query('INSERT OR IGNORE INTO rollup2_hours (hour) VALUES (?)').run(hour);
         db.exec('COMMIT');
     } catch (error) {
         db.exec('ROLLBACK');
@@ -92,9 +110,9 @@ export function rollupHour(db, hour) {
 // the whole log). Returns how many hours it did.
 export function rollupPending(db, now = Date.now() / 1000) {
     openRollup(db);
-    const first = db.query('SELECT min(at) AS at FROM events2').get().at;
+    const first = firstEventAt(db);
     if (first === null) return 0;
-    const done = new Set(db.query('SELECT hour FROM rollup_hours').values().map(([h]) => h));
+    const done = new Set(db.query('SELECT hour FROM rollup2_hours').values().map(([h]) => h));
     let count = 0;
     for (let hour = Math.floor(first / HOUR) * HOUR; hour + HOUR + GRACE_SECONDS <= now; hour += HOUR) {
         if (done.has(hour)) continue;
@@ -120,6 +138,8 @@ if (!isMainThread && workerData?.rollupDbPath) {
     const db = new Database(workerData.rollupDbPath, { strict: true });
     db.exec('PRAGMA busy_timeout = 5000');
     rollupPending(db);
+    // every hour before the cutoff is rolled up by now, so its raw events can go
+    expireEvents(db, Date.now() / 1000 - RETENTION_DAYS * 86400);
     db.close();
 }
 
@@ -130,7 +150,7 @@ const table = (rows, headers) =>
         ? [`| ${headers.join(' | ')} |`, `| ${headers.map(() => '---').join(' | ')} |`, ...rows.map((r) => `| ${r.join(' | ')} |`)].join('\n')
         : '_none_';
 
-// GET /rollup?since=&until=&config=key:value&match=regex&from=step&limit=40
+// GET /rollup?since=&until=&config=key:value&match=regex&path=a>b&limit=40 (from= is a 1-step path)
 // since/until round down to the hour. A player's group is their last exposure to
 // `key` in the window.
 export function readRollup(db, query) {
@@ -145,7 +165,7 @@ export function readRollup(db, query) {
     let group = null;
     if (configKey) {
         const last = new Map();
-        for (const [user, configs] of db.query('SELECT user_id, configs FROM rollup WHERE hour >= ? AND hour < ? AND configs IS NOT NULL ORDER BY hour').values(...range)) {
+        for (const [user, configs] of db.query('SELECT user_id, configs FROM rollup2 WHERE hour >= ? AND hour < ? AND configs IS NOT NULL ORDER BY hour').values(...range)) {
             const c = JSON.parse(configs);
             if (configKey in c) last.set(user, String(c[configKey]));
         }
@@ -156,7 +176,7 @@ export function readRollup(db, query) {
     const names = new Map(); // step -> [times, Set(players)]
     const edges = new Map();
     const buys = new Map(); // product@price -> [prompted, bought, cancelled, Set(players)]
-    for (const [user, blob] of db.query('SELECT user_id, data FROM rollup WHERE hour >= ? AND hour < ?').values(...range)) {
+    for (const [user, blob] of db.query('SELECT user_id, data FROM rollup2 WHERE hour >= ? AND hour < ?').values(...range)) {
         if (group && !group.has(user)) continue;
         players.add(user);
         const { n, e, b } = JSON.parse(inflateSync(blob));
@@ -173,7 +193,7 @@ export function readRollup(db, query) {
         }
     }
 
-    const hours = db.query('SELECT min(hour) AS lo, max(hour) AS hi, count(*) AS n FROM rollup_hours WHERE hour >= ? AND hour < ?').get(...range);
+    const hours = db.query('SELECT min(hour) AS lo, max(hour) AS hi, count(*) AS n FROM rollup2_hours WHERE hour >= ? AND hour < ?').get(...range);
     const out = ['# Rollup', ''];
     out.push(
         hours.n
@@ -218,21 +238,29 @@ export function readRollup(db, query) {
         '',
     );
 
-    const fromTotal = new Map();
+    // ?path=a>b>c (or ?from=a): what came next after walking those steps; without
+    // it, every single transition
+    const path = (query.path ?? query.from ?? '').split(/\s*>\s*/).filter(Boolean);
+    if (path.length >= MAX_PATH) throw new SyntaxError(`path can be at most ${MAX_PATH - 1} steps`);
+    const prefix = path.join('\t');
+    const rows = [];
+    const totals = new Map();
     for (const [k, v] of edges) {
-        const from = k.slice(0, k.indexOf('\t'));
-        fromTotal.set(from, (fromTotal.get(from) ?? 0) + v);
+        const steps = k.split('\t');
+        if (steps.length !== Math.max(path.length, 1) + 1) continue;
+        if (path.length ? !k.startsWith(`${prefix}\t`) : !(keep(steps[0]) || keep(steps[1]))) continue;
+        const from = steps.slice(0, -1).join(' > ');
+        rows.push([from, steps.at(-1), v]);
+        totals.set(from, (totals.get(from) ?? 0) + v);
     }
-    out.push(`## Transitions${query.from ? ` out of ${query.from}` : ''}`, '');
+    out.push(`## Transitions${path.length ? ` after ${path.join(' > ')}` : ''}`, '');
     out.push(
         table(
-            [...edges]
-                .map(([k, v]) => [...k.split('\t'), v])
-                .filter(([from, to]) => (query.from ? from === query.from : keep(from) || keep(to)))
+            rows
                 .sort((a, b) => b[2] - a[2])
                 .slice(0, limit)
-                .map(([from, to, v]) => [from, to, v, pct(v, fromTotal.get(from))]),
-            ['from', 'to', 'times', 'share of from'],
+                .map(([from, to, v]) => [from, to, v, pct(v, totals.get(from))]),
+            ['after', 'next', 'times', 'share'],
         ),
         '',
     );

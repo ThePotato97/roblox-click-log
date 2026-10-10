@@ -59,11 +59,48 @@ export function openDb(path) {
         );
         CREATE INDEX IF NOT EXISTS events2_user_at ON events2 (user_id, at);
         CREATE INDEX IF NOT EXISTS events2_at ON events2 (at);
+        -- events3: events2 with the event's text id swapped for an 8-byte hash.
+        -- The id is only there to drop retried batches, and as text it was stored
+        -- twice (row + unique index), ~70 bytes an event. New rows land here;
+        -- events2 empties out through expiry and is then dropped.
+        CREATE TABLE IF NOT EXISTS events3 (
+            hash        INTEGER NOT NULL,  -- 64-bit hash of the game's event id
+            at          REAL NOT NULL,
+            received_at REAL NOT NULL,
+            user_id     INTEGER NOT NULL,
+            session_id  INTEGER,
+            place       INTEGER,
+            place_id    INTEGER,
+            job_id      INTEGER,
+            studio      INTEGER NOT NULL DEFAULT 0,
+            kind        INTEGER NOT NULL,
+            name        INTEGER NOT NULL,
+            menu        INTEGER,
+            x           REAL,
+            y           REAL,
+            value       REAL,
+            props       TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS events3_hash ON events3 (hash);
+        CREATE INDEX IF NOT EXISTS events3_user_at ON events3 (user_id, at);
+        CREATE INDEX IF NOT EXISTS events3_at ON events3 (at);
+        -- each player's first event ever, kept past raw-event expiry so "new
+        -- player" still means new
+        CREATE TABLE IF NOT EXISTS users (
+            user_id  INTEGER PRIMARY KEY,
+            first_at REAL NOT NULL
+        );
     `);
     return db;
 }
 
-const hasLegacy = (db) => Boolean(db.query(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'`).get());
+const hasTable = (db, name) => Boolean(db.query(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name));
+const hasLegacy = (db) => hasTable(db, 'events');
+// the tables raw events live in, newest layout first ('events' is the all-text legacy one)
+const eventTables = (db) => ['events3', ...(hasTable(db, 'events2') ? ['events2'] : []), ...(hasLegacy(db) ? ['events'] : [])];
+
+// the game's text event id -> signed 64-bit integer for events3.hash
+export const eventHash = (id) => BigInt.asIntN(64, BigInt(Bun.hash(id)));
 
 // string -> strings.id for the writer, cached; dropped on rollback, since a
 // rolled-back id can be handed to a different string next time
@@ -104,16 +141,16 @@ function transaction(db, fn) {
 }
 
 const INSERT_SQL = `
-    INSERT OR IGNORE INTO events2
-        (id, at, received_at, user_id, session_id, place, place_id, job_id,
+    INSERT OR IGNORE INTO events3
+        (hash, at, received_at, user_id, session_id, place, place_id, job_id,
          studio, kind, name, menu, x, y, value, props)
     VALUES
-        ($id, $at, $received_at, $user_id, $session_id, $place, $place_id, $job_id,
+        ($hash, $at, $received_at, $user_id, $session_id, $place, $place_id, $job_id,
          $studio, $kind, $name, $menu, $x, $y, $value, $props)`;
 
-// a cleaned event (or an old-table row) as an events2 row
+// a cleaned event (or an old-table row) as an events3 row
 const toRow = (db, e) => ({
-    id: e.id,
+    hash: eventHash(e.id),
     at: e.at,
     received_at: e.received_at,
     user_id: e.user_id,
@@ -131,7 +168,7 @@ const toRow = (db, e) => ({
     props: e.props,
 });
 
-// One-time copy of the old all-text `events` table into events2, run after the
+// One-time copy of the old all-text `events` table into events3, run after the
 // server is listening, a batch at a time with a yield between batches so /health
 // and /ingest keep answering. Copied rows stay put until the table is dropped at
 // the end (deleting them as it went was ~1s per 5000 rows of index upkeep);
@@ -235,7 +272,7 @@ function readFilter({ since = null, until = null, userIds = null, includeStudio 
     }
     if (!includeStudio) where.push('studio = 0');
     if (legacy) {
-        // rows the migration already copied into events2
+        // rows the migration already copied into events2/events3
         where.push('rowid > $upto');
         params.upto = hasMigrated(legacy) ? migratedUpto(legacy) : 0;
         where.push(`NOT (kind = 'world' AND name IN (SELECT value FROM json_each($ground)))`);
@@ -248,7 +285,7 @@ function readFilter({ since = null, until = null, userIds = null, includeStudio 
 // batch at a time instead of holding every event in the window at once.
 export function readUsers(db, filter = {}) {
     const users = new Set();
-    for (const table of hasLegacy(db) ? ['events2', 'events'] : ['events2']) {
+    for (const table of eventTables(db)) {
         const { where, params } = readFilter(filter, table === 'events' ? db : null);
         for (const [id] of db.query(`SELECT DISTINCT user_id FROM ${table} WHERE ${where}`).values(params)) users.add(id);
     }
@@ -269,20 +306,22 @@ export function queryEvents(db, filter = {}) {
     const strings = stringsOf(db);
     const text = (id) => (id === null ? null : strings[id]);
     const { where, params } = readFilter(filter);
-    for (const r of db.query(`SELECT ${READ_COLUMNS} FROM events2 WHERE ${where}`).iterate(params)) {
-        rows.push({
-            at: r.at,
-            user_id: r.user_id,
-            session_id: text(r.session_id),
-            place: text(r.place),
-            kind: text(r.kind),
-            name: text(r.name),
-            menu: text(r.menu),
-            x: r.x,
-            y: r.y,
-            value: r.value,
-            props: r.props ? JSON.parse(r.props) : null,
-        });
+    for (const table of eventTables(db).filter((t) => t !== 'events')) {
+        for (const r of db.query(`SELECT ${READ_COLUMNS} FROM ${table} WHERE ${where}`).iterate(params)) {
+            rows.push({
+                at: r.at,
+                user_id: r.user_id,
+                session_id: text(r.session_id),
+                place: text(r.place),
+                kind: text(r.kind),
+                name: text(r.name),
+                menu: text(r.menu),
+                x: r.x,
+                y: r.y,
+                value: r.value,
+                props: r.props ? JSON.parse(r.props) : null,
+            });
+        }
     }
     if (hasLegacy(db)) {
         const seen = new Map();
@@ -311,13 +350,42 @@ export function queryEvents(db, filter = {}) {
 // Each player's first event anywhere in the log, for telling new players from
 // returning ones. One min() per player and table: SQLite answers each with a
 // single user-index seek, which an IN + GROUP BY (or a studio filter) would lose.
+// `users` remembers players whose early events have expired.
 export function firstSeen(db, userIds) {
-    const tables = hasLegacy(db) ? ['events2', 'events'] : ['events2'];
-    const stmts = tables.map((t) => db.query(`SELECT min(at) AS at FROM ${t} WHERE user_id = ?`));
+    const stmts = [
+        db.query('SELECT first_at AS at FROM users WHERE user_id = ?'),
+        ...eventTables(db).map((t) => db.query(`SELECT min(at) AS at FROM ${t} WHERE user_id = ?`)),
+    ];
     return new Map(
         [...userIds].map((id) => {
-            const ats = stmts.map((s) => s.get(id).at).filter((at) => at !== null);
+            const ats = stmts.map((s) => s.get(id)?.at ?? null).filter((at) => at !== null);
             return [id, ats.length ? Math.min(...ats) : null];
         }),
     );
+}
+
+// The earliest raw event still stored, or null.
+export function firstEventAt(db) {
+    const ats = eventTables(db).map((t) => db.query(`SELECT min(at) AS at FROM ${t}`).get().at).filter((at) => at !== null);
+    return ats.length ? Math.min(...ats) : null;
+}
+
+// Deletes raw events older than `before`, a batch at a time so /ingest's writes
+// never wait long, and drops events2 once it is empty. Each player's earliest
+// expiring event goes into `users` first, so no first visit is lost with it. Only
+// call it for hours the rollup already has.
+// shortcut: freed pages are reused by new rows, not given back to the volume; VACUUM
+// once if the file itself needs to shrink.
+export function expireEvents(db, before, batch = 5000) {
+    let deleted = 0;
+    for (const table of eventTables(db).filter((t) => t !== 'events')) {
+        db.query(
+            `INSERT INTO users (user_id, first_at) SELECT user_id, min(at) FROM ${table} WHERE at < ? GROUP BY user_id
+             ON CONFLICT (user_id) DO UPDATE SET first_at = min(first_at, excluded.first_at)`,
+        ).run(before);
+        const del = db.query(`DELETE FROM ${table} WHERE rowid IN (SELECT rowid FROM ${table} WHERE at < ? LIMIT ?)`);
+        for (let n; (n = Number(del.run(before, batch).changes)); ) deleted += n;
+        if (table === 'events2' && !db.query('SELECT 1 FROM events2 LIMIT 1').get()) db.exec('DROP TABLE events2');
+    }
+    return deleted;
 }

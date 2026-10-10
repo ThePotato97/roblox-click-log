@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { gzipSync } from 'node:zlib';
-import { insertEvents, migrateEvents, openDb, queryEvents } from '../src/db.mjs';
+import { expireEvents, firstSeen, insertEvents, migrateEvents, openDb, queryEvents } from '../src/db.mjs';
 import { buildJourneys, findRageClicks, report } from '../src/journeys.mjs';
 import { createApp } from '../src/server.mjs';
 import { runRead } from '../src/reads.mjs';
@@ -252,4 +252,18 @@ test('rollup: closed hours summarise once per player and /rollup adds them up by
     assert.match(out, /\| UI:Opened:Chaos \| click React\/Menus\/Container\/ExitButton \| 1 \|/);
     assert.doesNotMatch(out, /\| click React\/Menus\/Container\/Content\/Cards\/TacticalNuke\/Catcher \| Purchase/);
     assert.equal(runRead(db, '/rollup', { match: '(' }).status, 400);
+    // a 2-step path: what came after opening the menu and tapping the card
+    const after = read({ path: 'UI:Opened:Chaos > click React/Menus/Container/Content/Cards/TacticalNuke/Catcher' });
+    assert.match(after, /\| UI:Opened:Chaos > click React\/Menus\/Container\/Content\/Cards\/TacticalNuke\/Catcher \| Purchase:PromptOpened \| 1 \| 100\.0% \|/);
+    assert.match(read({ path: 'UI:Opened:Chaos > click React/Menus/Container/Content/Cards/TacticalNuke/Catcher > Purchase:PromptOpened' }), /\| Purchase:PromptFinished \| 1 \|/);
+});
+
+test('raw events expire, the rollup and first-seen survive it', () => {
+    const db = openDb(':memory:');
+    insertEvents(db, [ev(1, 0, 'event', 'UI:Opened:Chaos'), ev(1, 5, 'button', 'Hud/Spawn'), ev(2, 90_000, 'button', 'Hud/Spawn')]);
+    rollupPending(db, T0 + 100_000);
+    assert.equal(expireEvents(db, T0 + 50_000), 2);
+    assert.deepEqual(queryEvents(db).map((e) => e.user_id), [2]);
+    assert.equal(firstSeen(db, [1]).get(1), T0); // player 1's raw events are gone, their first visit isn't
+    assert.match(runRead(db, '/rollup', { since: String(T0 - 3600) }).body, /\| UI:Opened:Chaos \| 1 \| 1 \|/);
 });
