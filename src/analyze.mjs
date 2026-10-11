@@ -6,7 +6,7 @@
 //   bun src/analyze.mjs [--since 7d] [--until ...] [--user <userId>] [--timelines 20]
 //                       [--min-duration 3m] [--ended 1] [--user-type new]
 //                       [--config key:value ...] [--live-only] [--json]
-//                       [--paths [--path a>b] [--compare key:a --compare key:b]]
+//                       [--paths [--path a>b] [--compare key]]
 import { parseArgs } from 'node:util';
 import { openDb } from './db.mjs';
 import { runRead } from './reads.mjs';
@@ -18,7 +18,7 @@ const { values } = parseArgs({
         user: { type: 'string' },
         timelines: { type: 'string', default: '20' },
         config: { type: 'string', multiple: true },
-        compare: { type: 'string', multiple: true },
+        compare: { type: 'string' },
         // Studio playtest rows are included unless asked otherwise
         'live-only': { type: 'boolean', default: false },
         json: { type: 'boolean', default: false },

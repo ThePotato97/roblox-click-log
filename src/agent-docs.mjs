@@ -13,14 +13,17 @@ The read endpoints require this header:
 
 \`Authorization: Bearer <READ_TOKEN>\`
 
-\`GET /health\`, \`GET /agent\`, and \`GET /llms.txt\` do not require authentication.
+\`GET /health\`, \`GET /agent\`, \`GET /llms.txt\`, \`GET /\`, and
+\`GET /dashboard\` do not require authentication. The dashboard asks for the
+read token and keeps it in browser session storage.
 
 ## Recommended workflow
 
-1. Start with \`/report\` for aggregate behaviour and recent example timelines.
-2. Use \`/paths\` to inspect steps, transitions, purchase prompts, or what follows an exact path.
-3. Request \`/journeys\` only when full event-level JSON is needed; set a conservative \`limit\`.
-4. Narrow expensive reads with time and journey filters. Filters can be combined.
+1. Start with \`/configs\` to discover experiment keys, arms, and player counts.
+2. Use \`/report\` for aggregate behaviour and recent example timelines.
+3. Use \`/paths\` to inspect steps, transitions, purchase prompts, or compare all arms.
+4. Request \`/journeys\` only when full event-level JSON is needed; set a conservative \`limit\`.
+5. Narrow expensive reads with time and journey filters. Filters can be combined.
 
 ## Read endpoints
 
@@ -39,9 +42,9 @@ purchase prompts, and transitions. Parameters specific to this endpoint:
 - \`path=<step>[><step>...]\`: exact sequence of one to three steps; returns the next step.
 - \`limit=<n>\`: maximum step, transition, or follow-up rows; default 40, maximum 1000.
 - \`purchase_limit=<n>\`: independent maximum product rows; default 40, maximum 1000.
-- Repeat \`compare\` exactly twice with two values of the same key for side-by-side
+- \`compare=<config key>\`: discover every observed arm and show side-by-side
   step counts, distinct players, and player share, for example
-  \`compare=chaos_catalog:power&compare=chaos_catalog:disasters\`.
+  \`compare=chaos_catalog\`. Each player uses their latest value in the window.
 
 The purchase table reports prompt, purchase, and cancellation events; distinct
 prompted players and buyers; and distinct new and returning buyers.
@@ -55,6 +58,14 @@ Returns a JSON array containing complete journeys and events. Default window:
 \`since=7d\`. \`limit\` selects the newest journeys; default 100. Prefer a small
 limit because the response can be large. Responses support gzip.
 
+### GET /configs
+
+Returns JSON containing every config key and its observed arms, using each
+player's latest value in the window. Each config includes exposed-player counts
+per arm. Repeat \`config=key:value\` to restrict the player population to an
+intersection of arms and reveal interactions with every other config.
+Journey-level filters such as duration and clicks do not apply to this endpoint.
+
 ## Common parameters
 
 - \`since\`, \`until\`: \`30m\`, \`24h\`, \`7d\`, ISO timestamp, or Unix seconds.
@@ -64,7 +75,7 @@ limit because the response can be large. Responses support gzip.
 - \`studio=0\`: exclude Studio playtests.
 - \`config=key:value\`: select an experiment value; \`config=key\` selects anyone
   exposed. Repeat the parameter to AND filters across different keys. Conflicting
-  values for one key return \`400\`; use \`compare\` on \`/paths\` for two arms.
+  values for one key return \`400\`; use \`compare\` on \`/paths\` for all arms.
 - \`min_duration\`, \`max_duration\`: inclusive journey-duration bounds. Accept
   seconds or \`s\`, \`m\`, \`h\`, \`d\`, for example \`30s\` or \`5m\`.
 - \`min_clicks\`, \`max_clicks\`: inclusive non-event click-count bounds.
@@ -85,7 +96,9 @@ otherwise it is the span between the first and last event visible in the window.
 
 \`GET /paths?since=7d&user_type=new&path=UI%3AOpened%3AChaos&limit=20\`
 
-\`GET /paths?compare=chaos_catalog%3Apower&compare=chaos_catalog%3Adisasters&purchase_limit=100\`
+\`GET /paths?compare=chaos_catalog&purchase_limit=100\`
+
+\`GET /configs?since=7d&config=chaos_label%3Aicons\`
 
 \`GET /journeys?since=24h&event=Purchase%3APromptFinished&limit=25\`
 

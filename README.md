@@ -98,16 +98,19 @@ bun run analyze -- --live-only               # leave out Studio playtest rows
 In the cluster: `kubectl exec deploy/click-log -c app -- bun src/analyze.mjs --since 7d`.
 
 Machine-readable agent instructions are public at `GET /agent` (also
-`GET /llms.txt`). For data reads over HTTP, use
+`GET /llms.txt`). A browser config explorer is public at `GET /` (also
+`GET /dashboard`); it asks for the read token and keeps it in session storage.
+For data reads over HTTP, use
 `Authorization: Bearer <READ_TOKEN>`:
 
 | endpoint | returns | |
 | --- | --- | --- |
 | `GET /report` | markdown | the report below; `timelines=20` |
 | `GET /paths` | markdown | steps, purchase prompts, and transitions or what follows a path |
+| `GET /configs` | JSON | every config key and latest arm per player; supports repeated config filters |
 | `GET /journeys` | JSON | the newest `limit` (100) journeys in full; `user_id=` for one player |
 
-All three take `since` (default `7d`, `24h` for `/paths`) and `until` (`24h`, `7d`,
+The three journey endpoints take `since` (default `7d`, `24h` for `/paths`) and `until` (`24h`, `7d`,
 `30m`, an ISO date or unix seconds), `studio=0` for live-only, and
 `config=key:value` (e.g. `hud_autohide_moving:true`; `key` alone for anyone exposed)
 to select an experiment group. Repeat `config`, such as
@@ -132,8 +135,8 @@ All three also accept journey-level filters, which can be combined:
 
 The CLI uses the dashed equivalents, for example
 `--min-duration 3m --max-clicks 20 --ended 1 --user-type new --place casual`.
-Repeat `--config` or `--compare` as with the HTTP parameters; use
-`--purchase-limit` for the purchase table.
+Repeat `--config` as with the HTTP parameter; use `--compare chaos_catalog` to
+compare every observed arm and `--purchase-limit` for the purchase table.
 
 `/paths` also takes `match` (case-insensitive regex on step names, e.g.
 `Chaos|Nuke`), `path` (1-3 exact steps joined by `>`, e.g.
@@ -145,11 +148,17 @@ and purchase events, distinct prompted players and buyers, and distinct new and
 returning buyers. Its steps are event names, `click <full button path>` and world
 targets (full paths, unlike the report's shortened ones).
 
-For a side-by-side step comparison, repeat `compare` exactly twice with two values
-of one experiment key, for example
-`compare=chaos_catalog:power&compare=chaos_catalog:disasters`. The result gives
-times, distinct players, and player share for each step in both arms. Common
+For a side-by-side step comparison across every observed arm, provide one config
+key, for example `compare=chaos_catalog`. Players are assigned to their latest
+value for that key in the window. The result gives times, distinct players, and
+player share for each step in every arm, with arms ordered by value. Common
 `config` filters may still be repeated for other experiment keys.
+
+`/configs` powers the explorer. It applies the same time, user, Studio, and
+repeated `config` intersection filters, then returns every config distribution
+within that player slice. Each player contributes only their latest value for a
+key in the window, which lets the UI show how an arm in one experiment changes
+the arm distribution and path behaviour of another.
 
 The report covers:
 
