@@ -81,6 +81,13 @@ export function createApp({ db, ingestToken, readToken = ingestToken, isReady = 
             if (req.method === 'GET' && ['/report', '/journeys', '/paths'].includes(url.pathname)) {
                 if (!tokenMatches(req.headers.authorization, readToken)) return send(res, 401, { error: 'unauthorized' });
                 const query = Object.fromEntries(url.searchParams);
+                // Object.fromEntries keeps only one repeated parameter. These
+                // two are deliberately repeatable: config filters are ANDed,
+                // while two compare values define the experiment arms.
+                for (const key of ['config', 'compare']) {
+                    const values = url.searchParams.getAll(key);
+                    if (values.length > 1) query[key] = values;
+                }
                 const result = await runRead(db, url.pathname, query);
                 // gzip when asked: a journey repeats the same names and keys event after
                 // event, so 140MB of JSON goes out as ~13MB

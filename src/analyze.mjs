@@ -5,7 +5,8 @@
 //
 //   bun src/analyze.mjs [--since 7d] [--until ...] [--user <userId>] [--timelines 20]
 //                       [--min-duration 3m] [--ended 1] [--user-type new]
-//                       [--config key:value] [--live-only] [--json] [--paths [--path a>b]]
+//                       [--config key:value ...] [--live-only] [--json]
+//                       [--paths [--path a>b] [--compare key:a --compare key:b]]
 import { parseArgs } from 'node:util';
 import { openDb } from './db.mjs';
 import { runRead } from './reads.mjs';
@@ -16,7 +17,8 @@ const { values } = parseArgs({
         until: { type: 'string' },
         user: { type: 'string' },
         timelines: { type: 'string', default: '20' },
-        config: { type: 'string' },
+        config: { type: 'string', multiple: true },
+        compare: { type: 'string', multiple: true },
         // Studio playtest rows are included unless asked otherwise
         'live-only': { type: 'boolean', default: false },
         json: { type: 'boolean', default: false },
@@ -24,6 +26,7 @@ const { values } = parseArgs({
         path: { type: 'string' },
         match: { type: 'string' },
         limit: { type: 'string' },
+        'purchase-limit': { type: 'string' },
         'min-duration': { type: 'string' },
         'max-duration': { type: 'string' },
         'min-clicks': { type: 'string' },
@@ -44,10 +47,12 @@ const query = Object.fromEntries(
         user_id: values.user,
         timelines: values.timelines,
         config: values.config,
+        compare: values.compare,
         studio: values['live-only'] ? '0' : undefined,
         path: values.path,
         match: values.match,
         limit: values.limit ?? (values.json ? '1000000' : undefined),
+        purchase_limit: values['purchase-limit'],
         min_duration: values['min-duration'],
         max_duration: values['max-duration'],
         min_clicks: values['min-clicks'],
