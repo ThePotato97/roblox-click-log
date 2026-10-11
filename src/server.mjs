@@ -10,6 +10,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createGzip, gunzipSync } from 'node:zlib';
+import { AGENT_DOCS } from './agent-docs.mjs';
 import { insertEvents, openDb } from './db.mjs';
 import { runRead } from './reads.mjs';
 
@@ -64,6 +65,9 @@ export function createApp({ db, ingestToken, readToken = ingestToken, isReady = 
     return createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
         try {
+            if (req.method === 'GET' && ['/agent', '/llms.txt'].includes(url.pathname)) {
+                return send(res, 200, AGENT_DOCS, 'text/markdown');
+            }
             if (req.method === 'GET' && url.pathname === '/health') {
                 return send(res, isReady() ? 200 : 503, { ok: isReady(), image: process.env.IMAGE ?? null });
             }

@@ -67,6 +67,21 @@ async function withServer(fn, db, isReady) {
     }
 }
 
+test('agent documentation is public, current and available at its llms.txt alias', async () => {
+    await withServer(async (base) => {
+        for (const path of ['/agent', '/llms.txt']) {
+            const res = await fetch(base + path);
+            assert.equal(res.status, 200);
+            assert.match(res.headers.get('content-type'), /^text\/markdown/);
+            const body = await res.text();
+            assert.match(body, /Authorization: Bearer <READ_TOKEN>/);
+            assert.match(body, /min_duration/);
+            assert.match(body, /GET \/journeys/);
+            assert.doesNotMatch(body, /local-dev/);
+        }
+    });
+});
+
 test('ingest stores gzip batches, rejects bad auth, stores retries once', async () => {
     await withServer(async (base, db) => {
         const events = sample();
