@@ -144,15 +144,48 @@ test('the SQL report matches what the journeys say', async () => {
     assert.match(md, /\| world:sky \| \(quit\) \| 1 \| 100% \|/);
     assert.match(md, /## Journeys \(4 most recent of 4\)/);
     assert.match(md, /### Journey 1@1790000000 — user 1 \(new\)/);
-    // built a few players at a time, the answer is the same
-    assert.equal((await read(db, '/report', { timelines: '5' }, { sliceRows: 3 })).body, md);
-    for (const path of ['/paths', '/journeys']) assert.equal((await read(db, path, {}, { sliceRows: 3 })).body, (await read(db, path)).body);
 });
 
 test('mashing the speed upgrade is not rage, mashing a close button is', () => {
     const burst = (name) => [0, 0.3, 0.6, 0.9].map((at) => ({ kind: 'button', name, at }));
     assert.deepEqual(findRageClicks(burst('MainUI/Menus/SpeedUpgrade/Upgrades/CoinUpgrade/Catcher')), []);
     assert.deepEqual(findRageClicks(burst('MainUI/Menus/Shop/Header/CloseButton')).map((r) => r.count), [4]);
+});
+
+test('disk spilling preserves reports, config paths and journeys under a memory cap', async () => {
+    const db = await freshDb();
+    await db.exec(`INSERT INTO events (id, at, received_at, user_id, kind, name, props)
+        SELECT toString(number), fromUnixTimestamp64Milli(${T0 * 1000} + (number % 100) * 1000), now64(3),
+            toInt64(intDiv(number, 100)), if(number % 100 = 0, 'event', 'button'),
+            if(number % 100 = 0, 'config_exposure', if(number % 2 = 0, 'Hud/A', 'Hud/B')),
+            if(number % 100 = 0, '{"key":"test","value":true}', '')
+        FROM numbers(20000)`);
+    const capped = { settings: {
+        max_memory_usage: 256_000_000,
+        max_threads: 1,
+        max_bytes_before_external_group_by: 65_536,
+        max_bytes_before_external_sort: 65_536,
+        group_by_two_level_threshold: 1,
+        log_queries: 1,
+        log_comment: db.database,
+    } };
+    const inMemory = { settings: {
+        max_bytes_before_external_group_by: 0,
+        max_bytes_before_external_sort: 0,
+        max_bytes_ratio_before_external_group_by: 0,
+        max_bytes_ratio_before_external_sort: 0,
+    } };
+    for (const [path, query] of [
+        ['/report', { timelines: '2' }],
+        ['/paths', { config: 'test:true', path: 'click Hud/A' }],
+        ['/journeys', { limit: '2' }],
+    ]) {
+        assert.equal((await read(db, path, query, capped)).body, (await read(db, path, query, inMemory)).body);
+    }
+    await db.exec('SYSTEM FLUSH LOGS');
+    const [{ spills }] = await db.rows(`SELECT sum(ProfileEvents['ExternalAggregationWritePart']) AS spills
+        FROM system.query_log WHERE log_comment = {tag:String} AND type = 'QueryFinish'`, { params: { tag: db.database } });
+    assert.ok(spills > 0, 'exercise external aggregation, not just its settings');
 });
 
 test('?config=key:value keeps only journeys in that experiment group', async () => {
@@ -203,6 +236,25 @@ test('/paths: steps, purchases and next steps by config group (the player\'s las
     assert.match(two, /\| Purchase:PromptOpened \| 1 \| 1 \| 100% \|/);
     assert.match(await paths({ match: 'exitbutton' }), /\| UI:Opened:Chaos \| click React\/Menus\/Container\/ExitButton \| 1 \|/);
     assert.equal((await read(db, '/paths', { match: '(' })).status, 400);
+});
+
+test('follow-up paths handle long journeys, overlaps, short journeys and terminal steps', async () => {
+    const db = await freshDb([
+        ev(2, 0, 'button', 'Hud/A'), ev(2, 1, 'button', 'Hud/B'), ev(2, 2, 'button', 'Hud/A'),
+        ev(2, 3, 'event', 'session_ended'),
+        ev(3, 0, 'button', 'Hud/A'),
+        ev(4, 0, 'event', 'session_started'),
+    ]);
+    await db.exec(`INSERT INTO events (id, at, received_at, user_id, kind, name)
+        SELECT toString(number), fromUnixTimestamp64Milli(${T0 * 1000} + number * 10), now64(3),
+            1, 'button', if(number % 2 = 0, 'Hud/A', 'Hud/B') FROM numbers(20000)`);
+    const opts = { settings: { max_memory_usage: 256_000_000, max_threads: 1 } };
+    const three = (await read(db, '/paths', { path: 'click Hud/A>click Hud/B>click Hud/A' }, opts)).body;
+    assert.match(three, /\| click Hud\/B \| 9999 \| 1 \| 100% \|/);
+    assert.match(three, /\| \(quit\) \| 1 \| 1 \| 0% \|/);
+    const two = (await read(db, '/paths', { path: 'click Hud/A>click Hud/B' }, opts)).body;
+    assert.match(two, /\| click Hud\/A \| 10000 \| 2 \| 100% \|/);
+    assert.match(two, /\| \(end of window\) \| 1 \| 1 \| 0% \|/);
 });
 
 test('the old SQLite log copies over once, however often the copy runs', async () => {
