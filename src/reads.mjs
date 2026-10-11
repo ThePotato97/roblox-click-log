@@ -47,13 +47,12 @@ function configFilters(query) {
 }
 
 function comparisonOf(query) {
-    const arms = valuesOf(query.compare).filter((value) => value !== '').map((value) => parseConfig(value, 'compare'));
-    if (!arms.length) return null;
-    if (arms.length !== 2) throw badRequest('compare must be supplied exactly twice');
-    if (arms.some((arm) => arm.value === null)) throw badRequest('compare values must be key:value');
-    if (arms[0].key !== arms[1].key) throw badRequest('compare values must use the same config key');
-    if (arms[0].value === arms[1].value) throw badRequest('compare values must be different');
-    return { key: arms[0].key, arms };
+    const comparisons = valuesOf(query.compare).filter((value) => value !== '');
+    if (!comparisons.length) return null;
+    if (comparisons.length !== 1) throw badRequest('compare must be one config key');
+    const comparison = parseConfig(comparisons[0], 'compare');
+    if (comparison.value !== null) throw badRequest('compare must be a config key without a value');
+    return { key: comparison.key };
 }
 
 const configLabel = (query) => valuesOf(query.config).filter(Boolean).join(' + ') || 'everyone';
@@ -447,13 +446,11 @@ async function paths(db, session, w, query) {
     const q = (sql, settings) => db.rows(sql, { session, params: w.params, settings });
     if (comparison) {
         w.params.compareKey = comparison.key;
-        for (const [i, arm] of comparison.arms.entries()) w.params[`compareArm${i}`] = arm.value;
         await db.exec(`CREATE TEMPORARY TABLE compare_players ENGINE = MergeTree ORDER BY user_id AS
             SELECT user_id, argMax(${EXPOSURE_VALUE}, (at, id)) AS arm
             FROM events FINAL
             WHERE ${w.where} AND ${isExposure('compareKey')}
-            GROUP BY user_id
-            HAVING arm IN ({compareArm0:String}, {compareArm1:String})`, { session, params: w.params });
+            GROUP BY user_id`, { session, params: w.params });
     }
     const cohort = comparison ? 'in_group AND user_id IN (SELECT user_id FROM compare_players)' : 'in_group';
     const [o] = await q(`SELECT uniqExact(user_id) AS players, count() AS journeys, min(start) AS lo, max(end) AS hi FROM jr WHERE ${cohort}`);
@@ -464,14 +461,17 @@ async function paths(db, session, w, query) {
         return out.join('\n');
     }
     const summary = [['group', configLabel(query)], ['players', players], ['journeys', o.journeys]];
+    let arms = null;
     let armPlayers = null;
     if (comparison) {
         const counts = await q(`SELECT arm, uniqExact(jr.user_id) AS players
-            FROM jr INNER JOIN compare_players USING user_id WHERE in_group GROUP BY arm`);
+            FROM jr INNER JOIN compare_players USING user_id WHERE in_group GROUP BY arm ORDER BY arm`);
+        arms = counts.map((row) => row.arm);
         armPlayers = new Map(counts.map((row) => [row.arm, row.players]));
+        for (const [i, arm] of arms.entries()) w.params[`compareArm${i}`] = arm;
         summary.splice(1, 0,
-            ['comparison', comparison.arms.map((arm) => arm.raw).join(' vs ')],
-            ...comparison.arms.map((arm) => [`${arm.raw} players`, armPlayers.get(arm.value) ?? 0]),
+            ['comparison', comparison.key],
+            ...arms.map((arm) => [`${arm} players`, armPlayers.get(arm) ?? 0]),
         );
     }
     out.push(
@@ -484,25 +484,24 @@ async function paths(db, session, w, query) {
     // config_exposure is the grouping, not a step
     const STEPS = `arrayFilter(x -> x != 'config_exposure', steps)`;
     if (comparison) {
-        const [left, right] = comparison.arms;
         out.push('## Steps by experiment arm (events, clicks, world taps)', '');
-        const steps = await q(`SELECT k,
-                countIf(arm = {compareArm0:String}) AS n0, uniqExactIf(user_id, arm = {compareArm0:String}) AS p0,
-                countIf(arm = {compareArm1:String}) AS n1, uniqExactIf(user_id, arm = {compareArm1:String}) AS p1
+        const metrics = arms.flatMap((_, i) => [
+            `countIf(arm = {compareArm${i}:String}) AS n${i}`,
+            `uniqExactIf(user_id, arm = {compareArm${i}:String}) AS p${i}`,
+        ]).join(', ');
+        const maxPlayers = arms.length === 1 ? 'p0' : `greatest(${arms.map((_, i) => `p${i}`).join(', ')})`;
+        const maxTimes = arms.length === 1 ? 'n0' : `greatest(${arms.map((_, i) => `n${i}`).join(', ')})`;
+        const steps = await q(`SELECT k, ${metrics}
             FROM (
                 SELECT user_id, arm, arrayJoin(${STEPS}) AS k
                 FROM jr INNER JOIN compare_players USING user_id WHERE in_group
             ) GROUP BY k ${match ? `HAVING ${match}` : ''}
-            ORDER BY greatest(p0, p1) DESC, greatest(n0, n1) DESC, k LIMIT ${limit}`);
-        out.push(table(steps.map((r) => [
-            r.k,
-            r.n0, r.p0, pct(r.p0, armPlayers.get(left.value) ?? 0),
-            r.n1, r.p1, pct(r.p1, armPlayers.get(right.value) ?? 0),
-        ]), [
-            'step',
-            `${left.value} times`, `${left.value} players`, `${left.value} player share`,
-            `${right.value} times`, `${right.value} players`, `${right.value} player share`,
-        ]), '');
+            ORDER BY ${maxPlayers} DESC, ${maxTimes} DESC, k LIMIT ${limit}`);
+        out.push(table(steps.map((r) => [r.k, ...arms.flatMap((arm, i) => [
+            r[`n${i}`], r[`p${i}`], pct(r[`p${i}`], armPlayers.get(arm) ?? 0),
+        ])]), ['step', ...arms.flatMap((arm) => [
+            `${arm} times`, `${arm} players`, `${arm} player share`,
+        ])]), '');
     } else {
         out.push('## Steps (events, clicks, world taps)', '');
         const steps = await q(`SELECT arrayJoin(${STEPS}) AS k, count() AS n, uniqExact(user_id) AS p FROM jr WHERE ${cohort}
@@ -578,6 +577,43 @@ async function journeys(db, session, w, query) {
     })();
 }
 
+// Latest config value per player, then distributions within the intersection of
+// any repeated config filters. This powers the browser explorer without making
+// it download or parse raw journeys.
+async function configs(db, session, w, query) {
+    await db.exec(`CREATE TEMPORARY TABLE player_configs ENGINE = MergeTree ORDER BY (user_id, config_key) AS
+        SELECT user_id, JSONExtractString(props, 'key') AS config_key,
+            argMax(${EXPOSURE_VALUE}, (at, id)) AS config_value
+        FROM events FINAL
+        WHERE ${w.where} AND kind = 'event' AND name = 'config_exposure' AND config_key != ''
+        GROUP BY user_id, config_key`, { session, params: w.params });
+
+    const cohort = w.configs.length ? w.configs.map((_, i) => `user_id IN (
+        SELECT user_id FROM player_configs
+        WHERE config_key = {ckey${i}:String}
+            AND ({anyValue${i}:Bool} OR config_value = {cvalue${i}:String}))`).join(' AND ') : '1';
+    const opts = { session, params: w.params };
+    // A ClickHouse session permits one active query at a time.
+    const [overview] = await db.rows(`SELECT uniqExact(user_id) AS players FROM player_configs WHERE ${cohort}`, opts);
+    const rows = await db.rows(`SELECT config_key, config_value, uniqExact(user_id) AS players
+        FROM player_configs WHERE ${cohort}
+        GROUP BY config_key, config_value ORDER BY config_key, config_value`, opts);
+    const grouped = new Map();
+    for (const row of rows) {
+        if (!grouped.has(row.config_key)) grouped.set(row.config_key, []);
+        grouped.get(row.config_key).push({ value: row.config_value, players: row.players });
+    }
+    return JSON.stringify({
+        filters: w.configs.map((config) => config.raw),
+        players: overview.players,
+        configs: [...grouped].map(([key, arms]) => ({
+            key,
+            players: arms.reduce((total, arm) => total + arm.players, 0),
+            arms,
+        })),
+    });
+}
+
 // Returns { status, type, body } or { status, type, parts } for a read request;
 // `query` is the URL's searchParams as a plain object.
 // Optional settings let integration tests exercise spilling under a memory cap.
@@ -596,6 +632,7 @@ export async function runRead(db, pathname, query, { settings = {} } = {}) {
         if (query.compare !== undefined && pathname !== '/paths') throw badRequest('compare is only supported by /paths');
         if (pathname === '/report') return { status: 200, type: 'text/markdown', body: await report(db, session, windowOf(query, '7d'), query) };
         if (pathname === '/paths') return { status: 200, type: 'text/markdown', body: await paths(db, session, windowOf(query, '24h'), query) };
+        if (pathname === '/configs') return { status: 200, type: 'application/json', body: await configs(db, session, windowOf(query, '7d'), query) };
         return { status: 200, type: 'application/json', parts: await journeys(db, session, windowOf(query, '7d'), query) };
     } catch (error) {
         if (error.status !== 400) throw error;

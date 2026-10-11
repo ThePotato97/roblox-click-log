@@ -79,9 +79,26 @@ test('agent documentation is public, current and available at its llms.txt alias
             assert.match(body, /purchase_limit/);
             assert.match(body, /compare=chaos_catalog/);
             assert.match(body, /new and returning buyers/);
+            assert.match(body, /GET \/configs/);
             assert.match(body, /GET \/journeys/);
             assert.doesNotMatch(body, /local-dev/);
         }
+    });
+});
+
+test('the public dashboard is secret-free and uses the authenticated config API', async () => {
+    await withServer(async (base) => {
+        for (const path of ['/', '/dashboard']) {
+            const res = await fetch(base + path);
+            assert.equal(res.status, 200);
+            assert.match(res.headers.get('content-type'), /^text\/html/);
+            const body = await res.text();
+            assert.match(body, /Config explorer/);
+            assert.match(body, /api\('\/configs'/);
+            assert.match(body, /sessionStorage/);
+            assert.doesNotMatch(body, /local-dev|Bearer secret/);
+        }
+        assert.equal((await fetch(base + '/configs')).status, 401);
     });
 });
 
@@ -234,7 +251,7 @@ test('disk spilling preserves reports, config paths and journeys under a memory 
     for (const [path, query] of [
         ['/report', { timelines: '2' }],
         ['/paths', { config: 'test:true', path: 'click Hud/A' }],
-        ['/paths', { compare: ['test:true', 'test:false'], limit: '2' }],
+        ['/paths', { compare: 'test', limit: '2' }],
         ['/journeys', { limit: '2' }],
     ]) {
         assert.equal((await read(db, path, query, capped)).body, (await read(db, path, query, inMemory)).body);
@@ -274,29 +291,52 @@ test('repeated config filters survive HTTP parsing and are ANDed', async () => {
         const bad = await get('config=chaos_label%3Aicons&config=chaos_label%3Atext');
         assert.equal(bad.status, 400);
         assert.match((await bad.json()).error, /use compare/);
+
+        const configs = await (await fetch(`${base}/configs?since=${T0 - 1}`, {
+            headers: { Authorization: 'Bearer secret' },
+        })).json();
+        assert.equal(configs.players, 3);
+        assert.deepEqual(configs.configs, [
+            { key: 'chaos_catalog', players: 3, arms: [{ value: 'disasters', players: 1 }, { value: 'power', players: 2 }] },
+            { key: 'chaos_label', players: 3, arms: [{ value: 'icons', players: 2 }, { value: 'text', players: 1 }] },
+        ]);
+
+        const sliced = await (await fetch(`${base}/configs?since=${T0 - 1}&config=chaos_catalog%3Apower`, {
+            headers: { Authorization: 'Bearer secret' },
+        })).json();
+        assert.equal(sliced.players, 2);
+        assert.deepEqual(sliced.configs.find((config) => config.key === 'chaos_label').arms,
+            [{ value: 'icons', players: 1 }, { value: 'text', players: 1 }]);
     }, db);
 });
 
-test('/paths compares two experiment arms with per-step player share', async () => {
-    const exposure = (userId, value) => ev(userId, 0, 'event', 'config_exposure', { props: { key: 'chaos_catalog', value } });
+test('/paths discovers every experiment arm and compares per-step player share', async () => {
+    const exposure = (userId, value, key = 'chaos_catalog', at = 0) => ev(userId, at, 'event', 'config_exposure', { props: { key, value } });
     const db = await freshDb([
-        exposure(1, 'power'), ev(1, 1, 'event', 'UI:Opened:Chaos'),
-        exposure(2, 'power'), ev(2, 1, 'event', 'UI:Opened:Other'),
-        exposure(3, 'disasters'), ev(3, 1, 'event', 'UI:Opened:Chaos'),
-        exposure(4, 'disasters'), ev(4, 1, 'event', 'UI:Opened:Chaos'),
+        exposure(1, 'power'), exposure(1, 'mobile', 'segment', 0.5), ev(1, 1, 'event', 'UI:Opened:Chaos'),
+        exposure(2, 'power'), exposure(2, 'desktop', 'segment', 0.5), ev(2, 1, 'event', 'UI:Opened:Other'),
+        exposure(3, 'disasters'), exposure(3, 'mobile', 'segment', 0.5), ev(3, 1, 'event', 'UI:Opened:Chaos'),
+        exposure(4, 'disasters'), exposure(4, 'desktop', 'segment', 0.5), ev(4, 1, 'event', 'UI:Opened:Chaos'),
+        exposure(5, 'classic'), exposure(5, 'desktop', 'segment', 0.5), ev(5, 1, 'event', 'UI:Opened:Chaos'),
     ]);
     await withServer(async (base) => {
-        const res = await fetch(`${base}/paths?since=${T0 - 1}&compare=chaos_catalog%3Apower&compare=chaos_catalog%3Adisasters`, {
+        const res = await fetch(`${base}/paths?since=${T0 - 1}&compare=chaos_catalog`, {
             headers: { Authorization: 'Bearer secret' },
         });
         const body = await res.text();
         assert.match(body, /## Steps by experiment arm/);
-        assert.match(body, /\| chaos_catalog:power players \| 2 \|/);
-        assert.match(body, /\| chaos_catalog:disasters players \| 2 \|/);
-        assert.match(body, /\| UI:Opened:Chaos \| 1 \| 1 \| 50% \| 2 \| 2 \| 100% \|/);
+        assert.match(body, /\| classic players \| 1 \|/);
+        assert.match(body, /\| power players \| 2 \|/);
+        assert.match(body, /\| disasters players \| 2 \|/);
+        assert.match(body, /\| UI:Opened:Chaos \| 1 \| 1 \| 100% \| 2 \| 2 \| 100% \| 1 \| 1 \| 50% \|/);
     }, db);
-    assert.equal((await read(db, '/paths', { compare: ['chaos_catalog:power'] })).status, 400);
-    assert.equal((await read(db, '/report', { compare: ['chaos_catalog:power', 'chaos_catalog:disasters'] })).status, 400);
+    const sliced = (await read(db, '/paths', { compare: 'chaos_catalog', config: 'segment:mobile' })).body;
+    assert.doesNotMatch(sliced, /\| classic players \|/);
+    assert.match(sliced, /\| disasters players \| 1 \|/);
+    assert.match(sliced, /\| power players \| 1 \|/);
+    assert.equal((await read(db, '/paths', { compare: 'chaos_catalog:power' })).status, 400);
+    assert.equal((await read(db, '/paths', { compare: ['chaos_catalog', 'chaos_label'] })).status, 400);
+    assert.equal((await read(db, '/report', { compare: 'chaos_catalog' })).status, 400);
 });
 
 test('purchase rows have independent limits and unique buyer cohorts', async () => {

@@ -11,6 +11,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createGzip, gunzipSync } from 'node:zlib';
 import { AGENT_DOCS } from './agent-docs.mjs';
+import { DASHBOARD_HTML } from './dashboard.mjs';
 import { insertEvents, openDb } from './db.mjs';
 import { runRead } from './reads.mjs';
 
@@ -65,6 +66,9 @@ export function createApp({ db, ingestToken, readToken = ingestToken, isReady = 
     return createServer(async (req, res) => {
         const url = new URL(req.url, 'http://localhost');
         try {
+            if (req.method === 'GET' && ['/', '/dashboard'].includes(url.pathname)) {
+                return send(res, 200, DASHBOARD_HTML, 'text/html');
+            }
             if (req.method === 'GET' && ['/agent', '/llms.txt'].includes(url.pathname)) {
                 return send(res, 200, AGENT_DOCS, 'text/markdown');
             }
@@ -78,12 +82,13 @@ export function createApp({ db, ingestToken, readToken = ingestToken, isReady = 
                 if (!events || events.length > MAX_EVENTS_PER_REQUEST) return send(res, 400, { error: 'expected { events: [...] }' });
                 return send(res, 200, await insertEvents(db, events));
             }
-            if (req.method === 'GET' && ['/report', '/journeys', '/paths'].includes(url.pathname)) {
+            if (req.method === 'GET' && ['/report', '/journeys', '/paths', '/configs'].includes(url.pathname)) {
                 if (!tokenMatches(req.headers.authorization, readToken)) return send(res, 401, { error: 'unauthorized' });
                 const query = Object.fromEntries(url.searchParams);
-                // Object.fromEntries keeps only one repeated parameter. These
-                // two are deliberately repeatable: config filters are ANDed,
-                // while two compare values define the experiment arms.
+                // Object.fromEntries keeps only one repeated parameter. Config
+                // filters are deliberately repeatable and ANDed. Preserve a
+                // repeated compare too so validation rejects it instead of
+                // silently selecting one value.
                 for (const key of ['config', 'compare']) {
                     const values = url.searchParams.getAll(key);
                     if (values.length > 1) query[key] = values;
