@@ -93,7 +93,9 @@ test('the public dashboard is secret-free and uses the authenticated config API'
             assert.equal(res.status, 200);
             assert.match(res.headers.get('content-type'), /^text\/html/);
             const body = await res.text();
-            assert.match(body, /Config explorer/);
+            assert.match(body, /Config interaction flow/);
+            assert.match(body, /Most common transitions/);
+            assert.match(body, /renderSankey/);
             assert.match(body, /api\('\/configs'/);
             assert.match(body, /sessionStorage/);
             assert.doesNotMatch(body, /local-dev|Bearer secret/);
