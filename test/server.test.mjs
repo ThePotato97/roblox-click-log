@@ -76,6 +76,9 @@ test('agent documentation is public, current and available at its llms.txt alias
             const body = await res.text();
             assert.match(body, /Authorization: Bearer <READ_TOKEN>/);
             assert.match(body, /min_duration/);
+            assert.match(body, /purchase_limit/);
+            assert.match(body, /compare=chaos_catalog/);
+            assert.match(body, /new and returning buyers/);
             assert.match(body, /GET \/journeys/);
             assert.doesNotMatch(body, /local-dev/);
         }
@@ -210,7 +213,8 @@ test('disk spilling preserves reports, config paths and journeys under a memory 
         SELECT toString(number), fromUnixTimestamp64Milli(${T0 * 1000} + (number % 100) * 1000), now64(3),
             toInt64(intDiv(number, 100)), if(number % 100 = 0, 'event', 'button'),
             if(number % 100 = 0, 'config_exposure', if(number % 2 = 0, 'Hud/A', 'Hud/B')),
-            if(number % 100 = 0, '{"key":"test","value":true}', '')
+            if(number % 100 = 0,
+                concat('{"key":"test","value":', if(intDiv(number, 100) % 2 = 0, 'true', 'false'), '}'), '')
         FROM numbers(20000)`);
     const capped = { settings: {
         max_memory_usage: 256_000_000,
@@ -230,6 +234,7 @@ test('disk spilling preserves reports, config paths and journeys under a memory 
     for (const [path, query] of [
         ['/report', { timelines: '2' }],
         ['/paths', { config: 'test:true', path: 'click Hud/A' }],
+        ['/paths', { compare: ['test:true', 'test:false'], limit: '2' }],
         ['/journeys', { limit: '2' }],
     ]) {
         assert.equal((await read(db, path, query, capped)).body, (await read(db, path, query, inMemory)).body);
@@ -248,6 +253,75 @@ test('?config=key:value keeps only journeys in that experiment group', async () 
     assert.deepEqual(await users('hud_autohide_moving:false'), [2]);
     assert.deepEqual(await users('hud_autohide_moving'), [1, 2]);
     assert.match((await read(db, '/report', { config: 'hud_autohide_moving:false' })).body, /\| journeys \| 1 \|/);
+});
+
+test('repeated config filters survive HTTP parsing and are ANDed', async () => {
+    const exposure = (userId, at, key, value) => ev(userId, at, 'event', 'config_exposure', { props: { key, value } });
+    const db = await freshDb([
+        exposure(1, 0, 'chaos_catalog', 'power'), exposure(1, 1, 'chaos_label', 'icons'), ev(1, 2, 'event', 'Both:Matched'),
+        exposure(2, 0, 'chaos_catalog', 'power'), exposure(2, 1, 'chaos_label', 'text'), ev(2, 2, 'event', 'Only:Power'),
+        exposure(3, 0, 'chaos_catalog', 'disasters'), exposure(3, 1, 'chaos_label', 'icons'), ev(3, 2, 'event', 'Only:Icons'),
+    ]);
+    await withServer(async (base) => {
+        const get = (search) => fetch(`${base}/paths?since=${T0 - 1}&${search}`, {
+            headers: { Authorization: 'Bearer secret' },
+        });
+        const body = await (await get('config=chaos_catalog%3Apower&config=chaos_label%3Aicons')).text();
+        assert.match(body, /\| players \| 1 \|/);
+        assert.match(body, /Both:Matched/);
+        assert.doesNotMatch(body, /Only:Power|Only:Icons/);
+
+        const bad = await get('config=chaos_label%3Aicons&config=chaos_label%3Atext');
+        assert.equal(bad.status, 400);
+        assert.match((await bad.json()).error, /use compare/);
+    }, db);
+});
+
+test('/paths compares two experiment arms with per-step player share', async () => {
+    const exposure = (userId, value) => ev(userId, 0, 'event', 'config_exposure', { props: { key: 'chaos_catalog', value } });
+    const db = await freshDb([
+        exposure(1, 'power'), ev(1, 1, 'event', 'UI:Opened:Chaos'),
+        exposure(2, 'power'), ev(2, 1, 'event', 'UI:Opened:Other'),
+        exposure(3, 'disasters'), ev(3, 1, 'event', 'UI:Opened:Chaos'),
+        exposure(4, 'disasters'), ev(4, 1, 'event', 'UI:Opened:Chaos'),
+    ]);
+    await withServer(async (base) => {
+        const res = await fetch(`${base}/paths?since=${T0 - 1}&compare=chaos_catalog%3Apower&compare=chaos_catalog%3Adisasters`, {
+            headers: { Authorization: 'Bearer secret' },
+        });
+        const body = await res.text();
+        assert.match(body, /## Steps by experiment arm/);
+        assert.match(body, /\| chaos_catalog:power players \| 2 \|/);
+        assert.match(body, /\| chaos_catalog:disasters players \| 2 \|/);
+        assert.match(body, /\| UI:Opened:Chaos \| 1 \| 1 \| 50% \| 2 \| 2 \| 100% \|/);
+    }, db);
+    assert.equal((await read(db, '/paths', { compare: ['chaos_catalog:power'] })).status, 400);
+    assert.equal((await read(db, '/report', { compare: ['chaos_catalog:power', 'chaos_catalog:disasters'] })).status, 400);
+});
+
+test('purchase rows have independent limits and unique buyer cohorts', async () => {
+    const prompt = (userId, at, product, purchased) => [
+        ev(userId, at, 'event', 'Purchase:PromptOpened', { props: { name: product, price: 100 } }),
+        ev(userId, at + 1, 'event', 'Purchase:PromptFinished', { props: { name: product, price: 100, purchased } }),
+    ];
+    const db = await freshDb([
+        ev(1, 0, 'event', 'session_started'),
+        ...prompt(1, 1, 'ProductA', true), ...prompt(1, 3, 'ProductA', true), ...prompt(1, 5, 'ProductB', false),
+        ev(1, 10, 'event', 'session_ended', { value: 10 }),
+        ev(1, 4000, 'event', 'session_started'), ...prompt(1, 4001, 'ProductA', true),
+        ev(2, 0, 'event', 'session_started'), ...prompt(2, 1, 'ProductA', false),
+    ]);
+    const limitedSteps = (await read(db, '/paths', { limit: '1' })).body;
+    assert.match(limitedSteps, /prompted players \| buyers \| new buyers \| returning buyers/);
+    assert.match(limitedSteps, /\| ProductA@100 \| 4 \| 3 \| 1 \| 2 \| 1 \| 1 \| 1 \|/);
+    assert.match(limitedSteps, /\| ProductB@100 \| 1 \| 0 \| 1 \| 1 \| 0 \| 0 \| 0 \|/);
+
+    const oneProduct = (await read(db, '/paths', { purchase_limit: '1' })).body;
+    assert.match(oneProduct, /ProductA@100/);
+    assert.doesNotMatch(oneProduct, /ProductB@100/);
+
+    const newOnly = (await read(db, '/paths', { user_type: 'new' })).body;
+    assert.match(newOnly, /\| ProductA@100 \| 3 \| 2 \| 1 \| 2 \| 1 \| 1 \| 0 \|/);
 });
 
 test('/paths: steps, purchases and next steps by config group (the player\'s last exposure)', async () => {

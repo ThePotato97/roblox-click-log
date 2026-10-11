@@ -110,9 +110,12 @@ Machine-readable agent instructions are public at `GET /agent` (also
 All three take `since` (default `7d`, `24h` for `/paths`) and `until` (`24h`, `7d`,
 `30m`, an ISO date or unix seconds), `studio=0` for live-only, and
 `config=key:value` (e.g. `hud_autohide_moving:true`; `key` alone for anyone exposed)
-to compare experiment groups. For `/report` and `/journeys` a journey is in the
-group if it logged that exposure; for `/paths` a player is, by their last exposure
-in the window.
+to select an experiment group. Repeat `config`, such as
+`config=chaos_catalog:power&config=chaos_label:icons`, to AND filters across
+experiments. Conflicting values for one key return `400` instead of silently
+dropping one. For `/report` and `/journeys` a journey is in the group if it logged
+every exposure; for `/paths` a player is, by their last exposure for each key in
+the window.
 
 All three also accept journey-level filters, which can be combined:
 
@@ -129,13 +132,24 @@ All three also accept journey-level filters, which can be combined:
 
 The CLI uses the dashed equivalents, for example
 `--min-duration 3m --max-clicks 20 --ended 1 --user-type new --place casual`.
+Repeat `--config` or `--compare` as with the HTTP parameters; use
+`--purchase-limit` for the purchase table.
 
 `/paths` also takes `match` (case-insensitive regex on step names, e.g.
 `Chaos|Nuke`), `path` (1-3 exact steps joined by `>`, e.g.
 `UI:Opened:Chaos>click React/…/Cards/TacticalNuke/Catcher`: what came next after
-them, `(quit)` or `(end of window)` included) and `limit` (40 rows). Its steps are
-event names, `click <full button path>` and world targets (full paths, unlike the
-report's shortened ones).
+them, `(quit)` or `(end of window)` included), and `limit` (40 step, transition,
+or follow-up rows). `purchase_limit` independently controls purchase rows (40),
+so a small path limit does not hide products. The purchase table includes prompt
+and purchase events, distinct prompted players and buyers, and distinct new and
+returning buyers. Its steps are event names, `click <full button path>` and world
+targets (full paths, unlike the report's shortened ones).
+
+For a side-by-side step comparison, repeat `compare` exactly twice with two values
+of one experiment key, for example
+`compare=chaos_catalog:power&compare=chaos_catalog:disasters`. The result gives
+times, distinct players, and player share for each step in both arms. Common
+`config` filters may still be repeated for other experiment keys.
 
 The report covers:
 

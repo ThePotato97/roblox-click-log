@@ -37,7 +37,14 @@ purchase prompts, and transitions. Parameters specific to this endpoint:
 
 - \`match=<regex>\`: case-insensitive filter on displayed step/transition names.
 - \`path=<step>[><step>...]\`: exact sequence of one to three steps; returns the next step.
-- \`limit=<n>\`: maximum rows per section; default 40, maximum 1000.
+- \`limit=<n>\`: maximum step, transition, or follow-up rows; default 40, maximum 1000.
+- \`purchase_limit=<n>\`: independent maximum product rows; default 40, maximum 1000.
+- Repeat \`compare\` exactly twice with two values of the same key for side-by-side
+  step counts, distinct players, and player share, for example
+  \`compare=chaos_catalog:power&compare=chaos_catalog:disasters\`.
+
+The purchase table reports prompt, purchase, and cancellation events; distinct
+prompted players and buyers; and distinct new and returning buyers.
 
 Button steps are written as \`click <full button path>\`. URL-encode \`>\`, spaces,
 slashes, and other reserved characters in requests.
@@ -55,7 +62,9 @@ limit because the response can be large. Responses support gzip.
   before journeys are reconstructed.
 - \`user_id=<Roblox UserId>\`: one numeric user.
 - \`studio=0\`: exclude Studio playtests.
-- \`config=key:value\`: select an experiment value; \`config=key\` selects anyone exposed.
+- \`config=key:value\`: select an experiment value; \`config=key\` selects anyone
+  exposed. Repeat the parameter to AND filters across different keys. Conflicting
+  values for one key return \`400\`; use \`compare\` on \`/paths\` for two arms.
 - \`min_duration\`, \`max_duration\`: inclusive journey-duration bounds. Accept
   seconds or \`s\`, \`m\`, \`h\`, \`d\`, for example \`30s\` or \`5m\`.
 - \`min_clicks\`, \`max_clicks\`: inclusive non-event click-count bounds.
@@ -75,6 +84,8 @@ otherwise it is the span between the first and last event visible in the window.
 \`GET /report?since=24h&min_duration=3m&ended=1&studio=0&timelines=10\`
 
 \`GET /paths?since=7d&user_type=new&path=UI%3AOpened%3AChaos&limit=20\`
+
+\`GET /paths?compare=chaos_catalog%3Apower&compare=chaos_catalog%3Adisasters&purchase_limit=100\`
 
 \`GET /journeys?since=24h&event=Purchase%3APromptFinished&limit=25\`
 

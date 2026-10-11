@@ -23,6 +23,40 @@ const BOUNCES = [['15s', 15], ['1 min', 60], ['3 min', 180]];
 const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
 // a whole-number query param, clamped; goes into SQL as LIMIT
 const count = (value, fallback, max) => Math.min(max, Math.max(0, Math.floor(Number(value ?? fallback)) || 0));
+const valuesOf = (value) => (Array.isArray(value) ? value : value === undefined ? [] : [value]);
+
+function parseConfig(value, name = 'config') {
+    if (typeof value !== 'string' || value === '') throw badRequest(`${name} must be key or key:value`);
+    const colon = value.indexOf(':');
+    const key = colon === -1 ? value : value.slice(0, colon);
+    if (!key) throw badRequest(`${name} must include a key`);
+    return { raw: value, key, value: colon === -1 ? null : value.slice(colon + 1) };
+}
+
+function configFilters(query) {
+    const configs = valuesOf(query.config).filter((value) => value !== '').map((value) => parseConfig(value));
+    const byKey = new Map();
+    for (const config of configs) {
+        const previous = byKey.get(config.key);
+        if (previous && previous.raw !== config.raw) {
+            throw badRequest(`multiple config filters for ${config.key} are ambiguous; use compare for experiment arms`);
+        }
+        byKey.set(config.key, config);
+    }
+    return [...byKey.values()];
+}
+
+function comparisonOf(query) {
+    const arms = valuesOf(query.compare).filter((value) => value !== '').map((value) => parseConfig(value, 'compare'));
+    if (!arms.length) return null;
+    if (arms.length !== 2) throw badRequest('compare must be supplied exactly twice');
+    if (arms.some((arm) => arm.value === null)) throw badRequest('compare values must be key:value');
+    if (arms[0].key !== arms[1].key) throw badRequest('compare values must use the same config key');
+    if (arms[0].value === arms[1].value) throw badRequest('compare values must be different');
+    return { key: arms[0].key, arms };
+}
+
+const configLabel = (query) => valuesOf(query.config).filter(Boolean).join(' + ') || 'everyone';
 
 const FILTER_UNITS = { s: 1, m: 60, h: 3600, d: 86400 };
 function durationFilter(value, name) {
@@ -129,15 +163,18 @@ function windowOf(query, defaultSince) {
         params.user = query.user_id;
     }
     if (query.studio === '0') where.push('NOT studio');
-    // ?config=key:value: config_exposure events for key (and value, if given)
-    const [key, value] = (query.config ?? '').split(':');
-    params.ckey = key ?? '';
-    params.cvalue = value ?? '';
-    params.anyValue = value === undefined;
-    return { where: where.join(' AND '), params };
+    // Repeated ?config=key:value filters are ANDed. Keep each value bound rather
+    // than interpolating it into the journey-building SQL.
+    const configs = configFilters(query);
+    for (const [i, config] of configs.entries()) {
+        params[`ckey${i}`] = config.key;
+        params[`cvalue${i}`] = config.value ?? '';
+        params[`anyValue${i}`] = config.value === null;
+    }
+    return { where: where.join(' AND '), params, configs };
 }
 
-const IS_EXPOSURE = `kind = 'event' AND name = 'config_exposure' AND JSONExtractString(props, 'key') = {ckey:String}`;
+const isExposure = (key) => `kind = 'event' AND name = 'config_exposure' AND JSONExtractString(props, 'key') = {${key}:String}`;
 // String(props.value) in JS: true -> 'true', 'abc' -> 'abc'
 const EXPOSURE_VALUE = `if(JSONType(props, 'value') = 'String', JSONExtractString(props, 'value'), JSONExtractRaw(props, 'value'))`;
 
@@ -153,6 +190,10 @@ const SHORT = `if(kind = 'button' AND length(splitByChar('/', name)) > 4,
 async function journeyTable(db, session, w, query, { full = false, byPlayer = false } = {}) {
     const filters = journeyFilters(query, w);
     const lbl = full ? `if(kind = 'button', concat('click ', name), name)` : `if(kind = 'button', concat('click ', short), short)`;
+    const inGroup = w.configs.length ? w.configs.map((_, i) => byPlayer ? `user_id IN (
+        SELECT user_id FROM events WHERE ${w.where} AND ${isExposure(`ckey${i}`)}
+        GROUP BY user_id HAVING {anyValue${i}:Bool} OR argMax(${EXPOSURE_VALUE}, (at, id)) = {cvalue${i}:String})`
+    : `countIf(${isExposure(`ckey${i}`)} AND ({anyValue${i}:Bool} OR ${EXPOSURE_VALUE} = {cvalue${i}:String})) > 0`).join(' AND ') : '1';
     await db.exec(
         `CREATE TEMPORARY TABLE jr ENGINE = MergeTree ORDER BY (user_id, start) AS
         WITH
@@ -179,10 +220,7 @@ async function journeyTable(db, session, w, query, { full = false, byPlayer = fa
                     -- event span undercounts sessions that began before the window
                     ifNull(argMaxIf(value, (t, id), kind = 'event' AND name = 'session_ended'), end - start) AS dur,
                     countIf(kind != 'event') AS clicks,
-                    {ckey:String} = '' OR ${byPlayer ? `user_id IN (
-                        SELECT user_id FROM events WHERE ${w.where} AND ${IS_EXPOSURE}
-                        GROUP BY user_id HAVING {anyValue:Bool} OR argMax(${EXPOSURE_VALUE}, at) = {cvalue:String})`
-                    : `countIf(${IS_EXPOSURE} AND ({anyValue:Bool} OR ${EXPOSURE_VALUE} = {cvalue:String})) > 0`} AS in_group,
+                    ${inGroup} AS in_group,
                     -- every step but the session edges, in order
                     arrayMap(x -> x.3, arraySort(groupArrayIf((t, id, lbl), NOT edge))) AS steps,
                     -- clicks: (t, id, label, menu, short target, is button, name)
@@ -374,13 +412,13 @@ async function report(db, session, w, query) {
 
 // step -> next step over every journey, repeats folded, quits as an end node;
 // `cond` filters the (f, t) pairs, total is every edge out of f
-const transitions = (q, limit, cond = '1', steps = 'steps') =>
+const transitions = (q, limit, cond = '1', steps = 'steps', where = 'in_group') =>
     q(`SELECT f, t, n, total FROM (
             SELECT p.1 AS f, p.2 AS t, count() AS n, sum(n) OVER (PARTITION BY f) AS total
             FROM (
                 SELECT arrayJoin(arrayZip(arrayPopBack(s), arrayPopFront(s))) AS p
                 FROM (SELECT if(ended AND notEmpty(${steps}), arrayPushBack(arrayCompact(${steps}), '(quit)'), arrayCompact(${steps})) AS s
-                    FROM jr WHERE in_group)
+                    FROM jr WHERE ${where})
             ) GROUP BY f, t
         ) WHERE ${cond} ORDER BY n DESC, f, t LIMIT ${limit}`);
 
@@ -388,6 +426,11 @@ const transitions = (q, limit, cond = '1', steps = 'steps') =>
 // is their last exposure to the config key in the window.
 async function paths(db, session, w, query) {
     const limit = count(query.limit, 40, 1000) || 40;
+    const purchaseLimit = count(query.purchase_limit, 40, 1000) || 40;
+    const comparison = comparisonOf(query);
+    if (comparison && w.configs.some((config) => config.key === comparison.key)) {
+        throw badRequest(`compare key ${comparison.key} cannot also be a config filter`);
+    }
     let match = '';
     if (query.match) {
         try {
@@ -402,39 +445,91 @@ async function paths(db, session, w, query) {
     if (path.length > 3) throw badRequest('path takes at most 3 steps');
     await journeyTable(db, session, w, query, { full: true, byPlayer: true });
     const q = (sql, settings) => db.rows(sql, { session, params: w.params, settings });
-    const [o] = await q(`SELECT uniqExact(user_id) AS players, count() AS journeys, min(start) AS lo, max(end) AS hi FROM jr WHERE in_group`);
+    if (comparison) {
+        w.params.compareKey = comparison.key;
+        for (const [i, arm] of comparison.arms.entries()) w.params[`compareArm${i}`] = arm.value;
+        await db.exec(`CREATE TEMPORARY TABLE compare_players ENGINE = MergeTree ORDER BY user_id AS
+            SELECT user_id, argMax(${EXPOSURE_VALUE}, (at, id)) AS arm
+            FROM events FINAL
+            WHERE ${w.where} AND ${isExposure('compareKey')}
+            GROUP BY user_id
+            HAVING arm IN ({compareArm0:String}, {compareArm1:String})`, { session, params: w.params });
+    }
+    const cohort = comparison ? 'in_group AND user_id IN (SELECT user_id FROM compare_players)' : 'in_group';
+    const [o] = await q(`SELECT uniqExact(user_id) AS players, count() AS journeys, min(start) AS lo, max(end) AS hi FROM jr WHERE ${cohort}`);
     const players = o.players;
     const out = ['# Paths', ''];
     if (!o.journeys) {
         out.push('No events in range.');
         return out.join('\n');
     }
+    const summary = [['group', configLabel(query)], ['players', players], ['journeys', o.journeys]];
+    let armPlayers = null;
+    if (comparison) {
+        const counts = await q(`SELECT arm, uniqExact(jr.user_id) AS players
+            FROM jr INNER JOIN compare_players USING user_id WHERE in_group GROUP BY arm`);
+        armPlayers = new Map(counts.map((row) => [row.arm, row.players]));
+        summary.splice(1, 0,
+            ['comparison', comparison.arms.map((arm) => arm.raw).join(' vs ')],
+            ...comparison.arms.map((arm) => [`${arm.raw} players`, armPlayers.get(arm.value) ?? 0]),
+        );
+    }
     out.push(
         `${fmtDate(o.lo)} → ${fmtDate(o.hi)} UTC`,
         '',
-        table([['group', query.config ?? 'everyone'], ['players', players], ['journeys', o.journeys]], ['', '']),
+        table(summary, ['', '']),
         '',
     );
 
     // config_exposure is the grouping, not a step
     const STEPS = `arrayFilter(x -> x != 'config_exposure', steps)`;
-    out.push('## Steps (events, clicks, world taps)', '');
-    const steps = await q(`SELECT arrayJoin(${STEPS}) AS k, count() AS n, uniqExact(user_id) AS p FROM jr WHERE in_group
-        GROUP BY k ${match ? `HAVING ${match}` : ''} ORDER BY p DESC, n DESC, k LIMIT ${limit}`);
-    out.push(table(steps.map((r) => [r.k, r.n, r.p, pct(r.p, players)]), ['step', 'times', 'players', 'share of players']), '');
+    if (comparison) {
+        const [left, right] = comparison.arms;
+        out.push('## Steps by experiment arm (events, clicks, world taps)', '');
+        const steps = await q(`SELECT k,
+                countIf(arm = {compareArm0:String}) AS n0, uniqExactIf(user_id, arm = {compareArm0:String}) AS p0,
+                countIf(arm = {compareArm1:String}) AS n1, uniqExactIf(user_id, arm = {compareArm1:String}) AS p1
+            FROM (
+                SELECT user_id, arm, arrayJoin(${STEPS}) AS k
+                FROM jr INNER JOIN compare_players USING user_id WHERE in_group
+            ) GROUP BY k ${match ? `HAVING ${match}` : ''}
+            ORDER BY greatest(p0, p1) DESC, greatest(n0, n1) DESC, k LIMIT ${limit}`);
+        out.push(table(steps.map((r) => [
+            r.k,
+            r.n0, r.p0, pct(r.p0, armPlayers.get(left.value) ?? 0),
+            r.n1, r.p1, pct(r.p1, armPlayers.get(right.value) ?? 0),
+        ]), [
+            'step',
+            `${left.value} times`, `${left.value} players`, `${left.value} player share`,
+            `${right.value} times`, `${right.value} players`, `${right.value} player share`,
+        ]), '');
+    } else {
+        out.push('## Steps (events, clicks, world taps)', '');
+        const steps = await q(`SELECT arrayJoin(${STEPS}) AS k, count() AS n, uniqExact(user_id) AS p FROM jr WHERE ${cohort}
+            GROUP BY k ${match ? `HAVING ${match}` : ''} ORDER BY p DESC, n DESC, k LIMIT ${limit}`);
+        out.push(table(steps.map((r) => [r.k, r.n, r.p, pct(r.p, players)]), ['step', 'times', 'players', 'share of players']), '');
+    }
 
     out.push('## Purchase prompts', '');
-    const buys = await q(`SELECT concat(if(JSONHas(props, 'name'), JSONExtractString(props, 'name'), '?'), '@',
-            if(JSONHas(props, 'price'), JSONExtractRaw(props, 'price'), '?')) AS k,
-            countIf(name = 'Purchase:PromptOpened') AS o,
-            countIf(name = 'Purchase:PromptFinished' AND JSONExtractBool(props, 'purchased')) AS b,
-            countIf(name = 'Purchase:PromptFinished' AND NOT JSONExtractBool(props, 'purchased')) AS c,
-            uniqExact(user_id) AS p
-        FROM events AS e FINAL INNER JOIN (SELECT user_id, start, end FROM jr WHERE in_group) AS j USING user_id
-        WHERE ${w.where} AND kind = 'event' AND name IN ('Purchase:PromptOpened', 'Purchase:PromptFinished')
-            AND toUnixTimestamp64Milli(at) / 1000 BETWEEN j.start AND j.end
-        GROUP BY k ${match ? `HAVING ${match}` : ''} ORDER BY o DESC, k LIMIT ${limit}`);
-    out.push(table(buys.map((r) => [r.k, r.o, r.b, r.c, r.p]), ['product@price', 'prompted', 'bought', 'cancelled', 'players']), '');
+    const buys = await q(`SELECT k,
+            countIf(prompted) AS o, countIf(purchased) AS b, countIf(cancelled) AS c,
+            uniqExactIf(user_id, prompted) AS pp,
+            uniqExactIf(user_id, purchased) AS bp,
+            uniqExactIf(user_id, purchased AND is_new) AS nb,
+            uniqExactIf(user_id, purchased AND NOT is_new) AS rb
+        FROM (
+            SELECT concat(if(JSONHas(props, 'name'), JSONExtractString(props, 'name'), '?'), '@',
+                    if(JSONHas(props, 'price'), JSONExtractRaw(props, 'price'), '?')) AS k,
+                e.user_id AS user_id, j.is_new AS is_new,
+                name = 'Purchase:PromptOpened' AS prompted,
+                name = 'Purchase:PromptFinished' AND JSONExtractBool(props, 'purchased') AS purchased,
+                name = 'Purchase:PromptFinished' AND NOT JSONExtractBool(props, 'purchased') AS cancelled
+            FROM events AS e FINAL INNER JOIN (SELECT user_id, start, end, is_new FROM jr WHERE ${cohort}) AS j USING user_id
+            WHERE ${w.where} AND kind = 'event' AND name IN ('Purchase:PromptOpened', 'Purchase:PromptFinished')
+                AND toUnixTimestamp64Milli(at) / 1000 BETWEEN j.start AND j.end
+        ) GROUP BY k ${match ? `HAVING ${match}` : ''} ORDER BY o DESC, k LIMIT ${purchaseLimit}`);
+    out.push(table(buys.map((r) => [r.k, r.o, r.b, r.c, r.pp, r.bp, r.nb, r.rb]),
+        ['product@price', 'prompted', 'bought', 'cancelled', 'prompted players', 'buyers', 'new buyers', 'returning buyers']), '');
 
     if (path.length) {
         // what came next after the exact sequence, anywhere in a journey
@@ -449,7 +544,7 @@ async function paths(db, session, w, query) {
                     windows) AS nexts
                 FROM (
                     SELECT user_id, ended, s, arrayShingles(s, ${path.length}) AS windows
-                    FROM (SELECT user_id, ended, arrayCompact(${STEPS}) AS s FROM jr WHERE in_group)
+                    FROM (SELECT user_id, ended, arrayCompact(${STEPS}) AS s FROM jr WHERE ${cohort})
                     WHERE length(s) >= ${path.length}
                 )
             ) ARRAY JOIN nexts AS k
@@ -459,7 +554,7 @@ async function paths(db, session, w, query) {
     } else {
         out.push('## Transitions', '');
         const cond = match ? 'match(f, {match:String}) OR match(t, {match:String})' : '1';
-        const rows = await transitions(q, limit, cond, STEPS);
+        const rows = await transitions(q, limit, cond, STEPS, cohort);
         out.push(table(rows.map((r) => [r.f, r.t, r.n, pct(r.n, r.total)]), ['from', 'to', 'times', 'share of from']), '');
     }
     return out.join('\n');
@@ -498,6 +593,7 @@ export async function runRead(db, pathname, query, { settings = {} } = {}) {
     // temporary tables live in a session; one per request
     const session = randomUUID();
     try {
+        if (query.compare !== undefined && pathname !== '/paths') throw badRequest('compare is only supported by /paths');
         if (pathname === '/report') return { status: 200, type: 'text/markdown', body: await report(db, session, windowOf(query, '7d'), query) };
         if (pathname === '/paths') return { status: 200, type: 'text/markdown', body: await paths(db, session, windowOf(query, '24h'), query) };
         return { status: 200, type: 'application/json', parts: await journeys(db, session, windowOf(query, '7d'), query) };
