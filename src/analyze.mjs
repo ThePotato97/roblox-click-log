@@ -4,6 +4,7 @@
 // players doing?".
 //
 //   bun src/analyze.mjs [--since 7d] [--until ...] [--user <userId>] [--timelines 20]
+//                       [--min-duration 3m] [--ended 1] [--user-type new]
 //                       [--config key:value] [--live-only] [--json] [--paths [--path a>b]]
 import { parseArgs } from 'node:util';
 import { openDb } from './db.mjs';
@@ -23,6 +24,16 @@ const { values } = parseArgs({
         path: { type: 'string' },
         match: { type: 'string' },
         limit: { type: 'string' },
+        'min-duration': { type: 'string' },
+        'max-duration': { type: 'string' },
+        'min-clicks': { type: 'string' },
+        'max-clicks': { type: 'string' },
+        ended: { type: 'string' },
+        started: { type: 'string' },
+        'user-type': { type: 'string' },
+        place: { type: 'string' },
+        event: { type: 'string' },
+        menu: { type: 'string' },
     },
 });
 
@@ -37,6 +48,16 @@ const query = Object.fromEntries(
         path: values.path,
         match: values.match,
         limit: values.limit ?? (values.json ? '1000000' : undefined),
+        min_duration: values['min-duration'],
+        max_duration: values['max-duration'],
+        min_clicks: values['min-clicks'],
+        max_clicks: values['max-clicks'],
+        ended: values.ended,
+        started: values.started,
+        user_type: values['user-type'],
+        place: values.place,
+        event: values.event,
+        menu: values.menu,
     }).filter(([, v]) => v !== undefined),
 );
 const result = await runRead(openDb(), values.json ? '/journeys' : values.paths ? '/paths' : '/report', query);

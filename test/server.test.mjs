@@ -124,6 +124,43 @@ test('journeys split on quit and long gaps, and spot rage clicks', async () => {
     assert.deepEqual((await journeys(db, { limit: '1' })).map((j) => j.start - T0), [4000]);
 });
 
+test('journey filters combine across journeys, reports and paths', async () => {
+    const db = await freshDb([
+        ...sample(),
+        ev(4, 20, 'button', 'Lobby/Play', { place: 'lobby', menu: 'Lobby' }),
+    ]);
+    const filtered = await journeys(db, {
+        min_duration: '1m',
+        max_duration: '60',
+        min_clicks: '6',
+        max_clicks: '6',
+        ended: '1',
+        started: 'true',
+        user_type: 'new',
+        place: 'casual',
+        event: 'UI:Opened:Shop',
+        menu: 'Shop',
+    });
+    assert.deepEqual(filtered.map((j) => [j.userId, j.durationSeconds, j.clickCount, j.ended, j.userType]),
+        [[1, 60, 6, true, 'new']]);
+    assert.deepEqual((await journeys(db, { max_duration: '10s' })).map((j) => j.userId), [1, 2, 4]);
+    assert.deepEqual((await journeys(db, { ended: '0', started: '0' })).map((j) => j.userId), [2, 4]);
+    assert.deepEqual((await journeys(db, { user_type: 'returning' })).map((j) => j.userId), [1]);
+    assert.deepEqual((await journeys(db, { place: 'lobby' })).map((j) => j.userId), [4]);
+
+    assert.match((await read(db, '/report', { min_duration: '1m', ended: '1' })).body, /\| journeys \| 1 \|/);
+    assert.match((await read(db, '/paths', { event: 'UI:Opened:Shop', menu: 'Shop' })).body, /\| journeys \| 1 \|/);
+
+    for (const query of [
+        { min_duration: 'later' },
+        { min_duration: '2m', max_duration: '1m' },
+        { min_clicks: '-1' },
+        { min_clicks: '3', max_clicks: '2' },
+        { ended: 'yes' },
+        { user_type: 'existing' },
+    ]) assert.equal((await read(db, '/journeys', query)).status, 400);
+});
+
 test('the SQL report matches what the journeys say', async () => {
     const db = await freshDb([
         ...sample(),

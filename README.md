@@ -112,6 +112,22 @@ to compare experiment groups. For `/report` and `/journeys` a journey is in the
 group if it logged that exposure; for `/paths` a player is, by their last exposure
 in the window.
 
+All three also accept journey-level filters, which can be combined:
+
+| query parameter | keeps journeys where |
+| --- | --- |
+| `min_duration=30s`, `max_duration=2h` | duration is within the inclusive bounds; a bare number is seconds |
+| `min_clicks=3`, `max_clicks=50` | non-event click count is within the inclusive bounds |
+| `ended=1` / `ended=0` | a `session_ended` was / was not observed |
+| `started=1` / `started=0` | a `session_started` was / was not observed |
+| `user_type=new` / `user_type=returning` | it is / is not the player's first journey |
+| `place=casual` | at least one event has that exact place |
+| `event=UI:Opened:Shop` | at least one raw event has that exact name; button targets use their full path without `click ` |
+| `menu=Shop` | at least one click happened while that exact menu was open |
+
+The CLI uses the dashed equivalents, for example
+`--min-duration 3m --max-clicks 20 --ended 1 --user-type new --place casual`.
+
 `/paths` also takes `match` (case-insensitive regex on step names, e.g.
 `Chaos|Nuke`), `path` (1-3 exact steps joined by `>`, e.g.
 `UI:Opened:Chaos>click React/…/Cards/TacticalNuke/Catcher`: what came next after

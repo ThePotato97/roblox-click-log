@@ -24,6 +24,90 @@ const badRequest = (message) => Object.assign(new Error(message), { status: 400 
 // a whole-number query param, clamped; goes into SQL as LIMIT
 const count = (value, fallback, max) => Math.min(max, Math.max(0, Math.floor(Number(value ?? fallback)) || 0));
 
+const FILTER_UNITS = { s: 1, m: 60, h: 3600, d: 86400 };
+function durationFilter(value, name) {
+    if (value === undefined || value === '') return null;
+    const match = /^(\d+(?:\.\d+)?)([smhd]?)$/.exec(value);
+    if (!match) throw badRequest(`${name} must be seconds or a duration such as 30s, 5m, 2h or 1d`);
+    const seconds = Number(match[1]) * (FILTER_UNITS[match[2]] ?? 1);
+    if (!Number.isFinite(seconds)) throw badRequest(`${name} is too large`);
+    return seconds;
+}
+
+function integerFilter(value, name) {
+    if (value === undefined || value === '') return null;
+    if (!/^\d+$/.test(value)) throw badRequest(`${name} must be a non-negative whole number`);
+    const number = Number(value);
+    if (!Number.isSafeInteger(number)) throw badRequest(`${name} is too large`);
+    return number;
+}
+
+function booleanFilter(value, name) {
+    if (value === undefined || value === '') return null;
+    if (value === '1' || value === 'true') return true;
+    if (value === '0' || value === 'false') return false;
+    throw badRequest(`${name} must be 1 or 0`);
+}
+
+// Filters evaluated after events have been cut into journeys. Aggregate-backed
+// filters add one boolean while the journey row is already being built, avoiding
+// a second pass over raw events.
+function journeyFilters(query, w) {
+    const minDuration = durationFilter(query.min_duration, 'min_duration');
+    const maxDuration = durationFilter(query.max_duration, 'max_duration');
+    const minClicks = integerFilter(query.min_clicks, 'min_clicks');
+    const maxClicks = integerFilter(query.max_clicks, 'max_clicks');
+    if (minDuration !== null && maxDuration !== null && minDuration > maxDuration) {
+        throw badRequest('min_duration cannot exceed max_duration');
+    }
+    if (minClicks !== null && maxClicks !== null && minClicks > maxClicks) {
+        throw badRequest('min_clicks cannot exceed max_clicks');
+    }
+
+    const where = [];
+    const aggregates = [];
+    const addNumber = (value, key, column, operator, type) => {
+        if (value === null) return;
+        w.params[key] = value;
+        where.push(`${column} ${operator} {${key}:${type}}`);
+    };
+    addNumber(minDuration, 'minDuration', 'dur', '>=', 'Float64');
+    addNumber(maxDuration, 'maxDuration', 'dur', '<=', 'Float64');
+    addNumber(minClicks, 'minClicks', 'clicks', '>=', 'UInt64');
+    addNumber(maxClicks, 'maxClicks', 'clicks', '<=', 'UInt64');
+
+    const ended = booleanFilter(query.ended, 'ended');
+    const started = booleanFilter(query.started, 'started');
+    if (ended !== null) {
+        w.params.ended = ended;
+        where.push('ended = {ended:Bool}');
+    }
+    if (started !== null) {
+        w.params.started = started;
+        where.push('started = {started:Bool}');
+    }
+    if (query.user_type !== undefined && query.user_type !== '') {
+        if (!['new', 'returning'].includes(query.user_type)) throw badRequest('user_type must be new or returning');
+        w.params.isNew = query.user_type === 'new';
+        where.push('is_new = {isNew:Bool}');
+    }
+
+    for (const [key, expression] of [
+        ['place', 'countIf(place = {place:String}) > 0'],
+        ['event', 'countIf(name = {event:String}) > 0'],
+        ['menu', "countIf(kind != 'event' AND menu = {menu:String}) > 0"],
+    ]) {
+        if (query[key] === undefined || query[key] === '') continue;
+        w.params[key] = query[key];
+        aggregates.push(`${expression} AS matches_${key}`);
+        where.push(`matches_${key}`);
+    }
+    return {
+        aggregates: aggregates.length ? `, ${aggregates.join(', ')}` : '',
+        where: where.length ? where.join(' AND ') : '1',
+    };
+}
+
 // The request's filters as SQL over `events` plus their bound params.
 function windowOf(query, defaultSince) {
     let since, until;
@@ -66,7 +150,8 @@ const SHORT = `if(kind = 'button' AND length(splitByChar('/', name)) > 4,
 // `full` labels buttons by their whole path (/paths) instead of the shortened one.
 // The config group is per journey (it logged the exposure), or with `byPlayer`
 // the player's last exposure in the window.
-async function journeyTable(db, session, w, { full = false, byPlayer = false } = {}) {
+async function journeyTable(db, session, w, query, { full = false, byPlayer = false } = {}) {
+    const filters = journeyFilters(query, w);
     const lbl = full ? `if(kind = 'button', concat('click ', name), name)` : `if(kind = 'button', concat('click ', short), short)`;
     await db.exec(
         `CREATE TEMPORARY TABLE jr ENGINE = MergeTree ORDER BY (user_id, start) AS
@@ -74,7 +159,7 @@ async function journeyTable(db, session, w, { full = false, byPlayer = false } =
             e AS (
                 SELECT *, sum(brk) OVER (PARTITION BY user_id ORDER BY at, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS jn
                 FROM (
-                    SELECT user_id, at, id, kind, name, menu, value, props,
+                    SELECT user_id, at, id, place, kind, name, menu, value, props,
                         toUnixTimestamp64Milli(at) / 1000 AS t,
                         kind = 'event' AND name IN ('session_started', 'session_ended', 'teleported') AS edge,
                         ${SHORT} AS short,
@@ -88,6 +173,7 @@ async function journeyTable(db, session, w, { full = false, byPlayer = false } =
             ),
             j AS (
                 SELECT user_id, jn, min(t) AS start, max(t) AS end,
+                    countIf(kind = 'event' AND name = 'session_started') > 0 AS started,
                     countIf(kind = 'event' AND name = 'session_ended') > 0 AS ended,
                     -- session_ended carries the game's own session length; the first/last
                     -- event span undercounts sessions that began before the window
@@ -101,16 +187,19 @@ async function journeyTable(db, session, w, { full = false, byPlayer = false } =
                     arrayMap(x -> x.3, arraySort(groupArrayIf((t, id, lbl), NOT edge))) AS steps,
                     -- clicks: (t, id, label, menu, short target, is button, name)
                     arraySort(groupArrayIf((t, id, lbl, menu, short, kind = 'button', name), kind != 'event')) AS cl
+                    ${filters.aggregates}
                 FROM e GROUP BY user_id, jn
             )
-        SELECT j.*,
-            -- new = the player's first-ever event is in this journey's session (the
-            -- game's own user_type tag is unreliable)
-            f.first >= j.end - j.dur - 5 AS is_new
-        FROM j LEFT JOIN (
-            SELECT user_id, min(toUnixTimestamp64Milli(at)) / 1000 AS first FROM events
-            WHERE user_id IN (SELECT user_id FROM events WHERE ${w.where}) GROUP BY user_id
-        ) AS f USING user_id`,
+        SELECT * FROM (
+            SELECT j.*,
+                -- new = the player's first-ever event is in this journey's session (the
+                -- game's own user_type tag is unreliable)
+                f.first >= j.end - j.dur - 5 AS is_new
+            FROM j LEFT JOIN (
+                SELECT user_id, min(toUnixTimestamp64Milli(at)) / 1000 AS first FROM events
+                WHERE user_id IN (SELECT user_id FROM events WHERE ${w.where}) GROUP BY user_id
+            ) AS f USING user_id
+        ) WHERE ${filters.where}`,
         { session, params: w.params },
     );
 }
@@ -178,7 +267,7 @@ async function picks(db, session, sql) {
 }
 
 async function report(db, session, w, query) {
-    await journeyTable(db, session, w);
+    await journeyTable(db, session, w, query);
     const q = (sql) => db.rows(sql, { session });
     const [o] = await q(
         `SELECT count() AS nJourneys, uniqExact(user_id) AS players, countIf(ended) AS nEnded, countIf(is_new) AS nNew,
@@ -311,7 +400,7 @@ async function paths(db, session, w, query) {
     }
     const path = (query.path ?? query.from ?? '').split('>').filter(Boolean);
     if (path.length > 3) throw badRequest('path takes at most 3 steps');
-    await journeyTable(db, session, w, { full: true, byPlayer: true });
+    await journeyTable(db, session, w, query, { full: true, byPlayer: true });
     const q = (sql, settings) => db.rows(sql, { session, params: w.params, settings });
     const [o] = await q(`SELECT uniqExact(user_id) AS players, count() AS journeys, min(start) AS lo, max(end) AS hi FROM jr WHERE in_group`);
     const players = o.players;
@@ -341,9 +430,9 @@ async function paths(db, session, w, query) {
             countIf(name = 'Purchase:PromptFinished' AND JSONExtractBool(props, 'purchased')) AS b,
             countIf(name = 'Purchase:PromptFinished' AND NOT JSONExtractBool(props, 'purchased')) AS c,
             uniqExact(user_id) AS p
-        FROM events FINAL
+        FROM events AS e FINAL INNER JOIN (SELECT user_id, start, end FROM jr WHERE in_group) AS j USING user_id
         WHERE ${w.where} AND kind = 'event' AND name IN ('Purchase:PromptOpened', 'Purchase:PromptFinished')
-            AND user_id IN (SELECT user_id FROM jr WHERE in_group)
+            AND toUnixTimestamp64Milli(at) / 1000 BETWEEN j.start AND j.end
         GROUP BY k ${match ? `HAVING ${match}` : ''} ORDER BY o DESC, k LIMIT ${limit}`);
     out.push(table(buys.map((r) => [r.k, r.o, r.b, r.c, r.p]), ['product@price', 'prompted', 'bought', 'cancelled', 'players']), '');
 
@@ -377,7 +466,7 @@ async function paths(db, session, w, query) {
 }
 
 async function journeys(db, session, w, query) {
-    await journeyTable(db, session, w);
+    await journeyTable(db, session, w, query);
     // the newest `limit`, then in player and time order
     const limit = count(query.limit, 100, 10_000_000);
     const picked = `SELECT user_id, start, end, is_new FROM jr WHERE in_group ORDER BY start DESC, user_id LIMIT ${limit}`;
