@@ -97,7 +97,9 @@ bun run analyze -- --live-only               # leave out Studio playtest rows
 
 In the cluster: `kubectl exec deploy/click-log -c app -- bun src/analyze.mjs --since 7d`.
 
-Or over HTTP, with `Authorization: Bearer <READ_TOKEN>`:
+Machine-readable agent instructions are public at `GET /agent` (also
+`GET /llms.txt`). For data reads over HTTP, use
+`Authorization: Bearer <READ_TOKEN>`:
 
 | endpoint | returns | |
 | --- | --- | --- |
