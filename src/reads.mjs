@@ -7,6 +7,16 @@ import {
     GAP_SECONDS, RAGE_IGNORE, RAGE_MIN_CLICKS, RAGE_WINDOW_SECONDS, buildJourneys, fmtClock, fmtDate, parseSince, pct, table, timeline,
 } from './journeys.mjs';
 
+// Keep large reads within the server's memory budget: spill aggregate/sort state
+// to disk and limit parallel working sets. Applies to reads only, not ingestion.
+// https://clickhouse.com/docs/knowledgebase/memory-limit-exceeded-for-query
+const READ_SETTINGS = {
+    max_bytes_before_external_group_by: 64_000_000,
+    max_bytes_before_external_sort: 64_000_000,
+    max_threads: 4,
+    join_algorithm: 'auto',
+};
+
 // bounce cut-offs, shortest first
 const BOUNCES = [['15s', 15], ['1 min', 60], ['3 min', 180]];
 
@@ -302,7 +312,7 @@ async function paths(db, session, w, query) {
     const path = (query.path ?? query.from ?? '').split('>').filter(Boolean);
     if (path.length > 3) throw badRequest('path takes at most 3 steps');
     await journeyTable(db, session, w, { full: true, byPlayer: true });
-    const q = (sql) => db.rows(sql, { session, params: w.params });
+    const q = (sql, settings) => db.rows(sql, { session, params: w.params, settings });
     const [o] = await q(`SELECT uniqExact(user_id) AS players, count() AS journeys, min(start) AS lo, max(end) AS hi FROM jr WHERE in_group`);
     const players = o.players;
     const out = ['# Paths', ''];
@@ -340,11 +350,21 @@ async function paths(db, session, w, query) {
     if (path.length) {
         // what came next after the exact sequence, anywhere in a journey
         w.params.path = path.map((s) => `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`);
-        const next = await q(`SELECT if(i + ${path.length} > length(s), if(ended, '(quit)', '(end of window)'), s[i + ${path.length}]) AS k,
-                count() AS n, uniqExact(user_id) AS p, sum(n) OVER () AS total
-            FROM (SELECT user_id, ended, arrayCompact(${STEPS}) AS s FROM jr WHERE in_group)
-            ARRAY JOIN arrayFilter(i -> arraySlice(s, i, ${path.length}) = {path:Array(String)}, arrayEnumerate(s)) AS i
-            GROUP BY k ORDER BY n DESC, k LIMIT ${limit}`);
+        // Compare fixed-size windows without capturing the entire journey in a
+        // per-index lambda. Expand only the matching next labels, not full arrays.
+        // A row is a whole journey, so keep blocks small for this array operation.
+        const next = await q(`SELECT k, count() AS n, uniqExact(user_id) AS p, sum(n) OVER () AS total
+            FROM (
+                SELECT user_id, arrayFilter((next, window) -> window = {path:Array(String)},
+                    arrayResize(arraySlice(s, ${path.length + 1}), length(windows), if(ended, '(quit)', '(end of window)')),
+                    windows) AS nexts
+                FROM (
+                    SELECT user_id, ended, s, arrayShingles(s, ${path.length}) AS windows
+                    FROM (SELECT user_id, ended, arrayCompact(${STEPS}) AS s FROM jr WHERE in_group)
+                    WHERE length(s) >= ${path.length}
+                )
+            ) ARRAY JOIN nexts AS k
+            GROUP BY k ORDER BY n DESC, k LIMIT ${limit}`, { max_block_size: 256 });
         out.push(`## After ${path.join(' → ')}`, '');
         out.push(table(next.map((r) => [r.k, r.n, r.p, pct(r.n, r.total)]), ['next', 'times', 'players', 'share']), '');
     } else {
@@ -376,7 +396,16 @@ async function journeys(db, session, w, query) {
 
 // Returns { status, type, body } or { status, type, parts } for a read request;
 // `query` is the URL's searchParams as a plain object.
-export async function runRead(db, pathname, query) {
+// Optional settings let integration tests exercise spilling under a memory cap.
+export async function runRead(db, pathname, query, { settings = {} } = {}) {
+    const source = db;
+    db = {};
+    for (const method of ['exec', 'rows', 'query']) {
+        db[method] = (sql, opts = {}) => source[method](sql, {
+            ...opts,
+            settings: { ...READ_SETTINGS, ...settings, ...opts.settings },
+        });
+    }
     // temporary tables live in a session; one per request
     const session = randomUUID();
     try {
