@@ -63,12 +63,14 @@ docker run -p 8787:8787 -e INGEST_TOKEN=... -e CLICKHOUSE_URL=http://clickhouse:
 If ClickHouse is down, `/ingest` answers 503 and the game's sink keeps the batch
 and retries.
 
-Large reads use ClickHouse's external aggregation and sorting, with 64 MB spill
-thresholds, at most four query threads, and `join_algorithm=auto`. These settings
-apply only to `/report`, `/paths` and `/journeys`; ingestion is unaffected. The
-journey table is built by one query, so players aren't read in separate snapshots.
-Follow-up paths compare fixed-size step windows and expand only matching next
-labels, avoiding per-position copies of the full journey array.
+Journeys are built a few players at a time: events are grouped per player in
+the table's own `(user_id, at, id)` order (`optimize_aggregation_in_order`) and
+cut into journeys with `arraySplit`, so memory doesn't grow with the read
+window. Full journeys for `/journeys` and timelines are streamed in the same
+order, with no join or sort. Large follow-up aggregations use ClickHouse's
+external aggregation and sorting, with 64 MB spill thresholds, at most four
+query threads, and `join_algorithm=auto`. These settings apply only to
+`/report`, `/paths` and `/journeys`; ingestion is unaffected.
 ClickHouse needs writable temporary disk space (`tmp_path`) for spilling. The
 thresholds are not a total memory cap: configure the server's query/user memory
 limits for the available RAM and concurrent workload. See the

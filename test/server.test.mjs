@@ -264,6 +264,32 @@ test('disk spilling preserves reports, config paths and journeys under a memory 
     assert.ok(spills > 0, 'exercise external aggregation, not just its settings');
 });
 
+test('building journeys takes memory per player, not per window', { timeout: 60_000 }, async () => {
+    const db = await freshDb();
+    // `players` more players x 500 events with long paths and props
+    const addPlayers = (from, players) => db.exec(`INSERT INTO events (id, at, received_at, user_id, kind, name, menu, props)
+        SELECT toString(number), fromUnixTimestamp64Milli(${T0 * 1000} + (number % 500) * 1000), now64(3),
+            toInt64(intDiv(number, 500)), if(number % 3 = 0, 'event', 'button'),
+            concat('MainUI/Root/Menus/Shop/Items/Card', toString(number % 40), '/BuyButton/Catcher'),
+            'Shop', '{"amount":5,"source":"coindrop","balance":123456789}'
+        FROM numbers(${from * 500}, ${players * 500})`);
+    const peak = async (tag) => {
+        const body = (await read(db, '/report', { timelines: '1', menu: 'Shop' }, { settings: { log_comment: tag } })).body;
+        await db.exec('SYSTEM FLUSH LOGS');
+        const [{ m }] = await db.rows(`SELECT max(memory_usage) AS m FROM system.query_log
+            WHERE log_comment = {tag:String} AND type = 'QueryFinish' AND query LIKE 'CREATE TEMPORARY TABLE jr%'`, { params: { tag } });
+        return { body, m };
+    };
+    await addPlayers(0, 1000);
+    const small = await peak(`${db.database}_small`);
+    assert.match(small.body, /\| journeys \| 1000 \|/);
+    await addPlayers(1000, 7000);
+    const large = await peak(`${db.database}_large`);
+    assert.match(large.body, /\| journeys \| 8000 \|/);
+    // 8x the players; the old window-function build grew with them
+    assert.ok(large.m < small.m * 2, `${large.m} bytes for 8x the players vs ${small.m}`);
+});
+
 test('?config=key:value keeps only journeys in that experiment group', async () => {
     const exposure = (userId, value) => ev(userId, 1, 'event', 'config_exposure', { props: { key: 'hud_autohide_moving', value } });
     const db = await freshDb([...sample(), exposure(1, true), exposure(2, false)]);
