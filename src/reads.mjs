@@ -82,10 +82,10 @@ function booleanFilter(value, name) {
     throw badRequest(`${name} must be 1 or 0`);
 }
 
-// Filters evaluated after events have been cut into journeys. Aggregate-backed
-// filters add one boolean while the journey row is already being built, avoiding
-// a second pass over raw events.
-function journeyFilters(query, w) {
+// Filters evaluated after events have been cut into journeys. Event-level
+// filters (place, event, menu) become per-event marks, OR-ed over the journey
+// while it is cut (see journeyTable), so they cost no second pass over raw events.
+function journeyFilters(query, w, marks) {
     const minDuration = durationFilter(query.min_duration, 'min_duration');
     const maxDuration = durationFilter(query.max_duration, 'max_duration');
     const minClicks = integerFilter(query.min_clicks, 'min_clicks');
@@ -98,7 +98,6 @@ function journeyFilters(query, w) {
     }
 
     const where = [];
-    const aggregates = [];
     const addNumber = (value, key, column, operator, type) => {
         if (value === null) return;
         w.params[key] = value;
@@ -126,19 +125,16 @@ function journeyFilters(query, w) {
     }
 
     for (const [key, expression] of [
-        ['place', 'countIf(place = {place:String}) > 0'],
-        ['event', 'countIf(name = {event:String}) > 0'],
-        ['menu', "countIf(kind != 'event' AND menu = {menu:String}) > 0"],
+        ['place', 'place = {place:String}'],
+        ['event', 'name = {event:String}'],
+        ['menu', "kind != 'event' AND menu = {menu:String}"],
     ]) {
         if (query[key] === undefined || query[key] === '') continue;
         w.params[key] = query[key];
-        aggregates.push(`${expression} AS matches_${key}`);
-        where.push(`matches_${key}`);
+        where.push(`bitTest(marks, ${marks.length})`);
+        marks.push(expression);
     }
-    return {
-        aggregates: aggregates.length ? `, ${aggregates.join(', ')}` : '',
-        where: where.length ? where.join(' AND ') : '1',
-    };
+    return where;
 }
 
 // The request's filters as SQL over `events` plus their bound params.
@@ -186,58 +182,70 @@ const SHORT = `if(kind = 'button' AND length(splitByChar('/', name)) > 4,
 // `full` labels buttons by their whole path (/paths) instead of the shortened one.
 // The config group is per journey (it logged the exposure), or with `byPlayer`
 // the player's last exposure in the window.
+//
+// Events are grouped per player straight off the table, which is sorted by
+// player: with optimize_aggregation_in_order each player's array is finished as
+// soon as the next player starts, so memory holds a few players, not the window.
+// The array is then cut into journeys with arraySplit (no window functions, no
+// sort over the whole window).
 async function journeyTable(db, session, w, query, { full = false, byPlayer = false } = {}) {
-    const filters = journeyFilters(query, w);
     const lbl = full ? `if(kind = 'button', concat('click ', name), name)` : `if(kind = 'button', concat('click ', short), short)`;
-    const inGroup = w.configs.length ? w.configs.map((_, i) => byPlayer ? `user_id IN (
+    // per-event flags, OR-ed per journey into `marks`: config exposures (unless
+    // byPlayer), then the event-level filters
+    const marks = byPlayer ? [] : w.configs.map((_, i) => `${isExposure(`ckey${i}`)} AND ({anyValue${i}:Bool} OR ${EXPOSURE_VALUE} = {cvalue${i}:String})`);
+    const where = journeyFilters(query, w, marks);
+    const mark = marks.length ? marks.map((m, i) => `bitShiftLeft(toUInt64(${m}), ${i})`).join(' + ') : 'toUInt64(0)';
+    const inGroup = !w.configs.length ? '1' : byPlayer ? w.configs.map((_, i) => `user_id IN (
         SELECT user_id FROM events WHERE ${w.where} AND ${isExposure(`ckey${i}`)}
-        GROUP BY user_id HAVING {anyValue${i}:Bool} OR argMax(${EXPOSURE_VALUE}, (at, id)) = {cvalue${i}:String})`
-    : `countIf(${isExposure(`ckey${i}`)} AND ({anyValue${i}:Bool} OR ${EXPOSURE_VALUE} = {cvalue${i}:String})) > 0`).join(' AND ') : '1';
+        GROUP BY user_id HAVING {anyValue${i}:Bool} OR argMax(${EXPOSURE_VALUE}, (at, id)) = {cvalue${i}:String})`).join(' AND ')
+        : w.configs.map((_, i) => `bitTest(marks, ${i})`).join(' AND ');
+    // x: (t, id, label, menu, short target, kind, name, value, marks)
     await db.exec(
         `CREATE TEMPORARY TABLE jr ENGINE = MergeTree ORDER BY (user_id, start) AS
-        WITH
-            e AS (
-                SELECT *, sum(brk) OVER (PARTITION BY user_id ORDER BY at, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS jn
-                FROM (
-                    SELECT user_id, at, id, place, kind, name, menu, value, props,
-                        toUnixTimestamp64Milli(at) / 1000 AS t,
-                        kind = 'event' AND name IN ('session_started', 'session_ended', 'teleported') AS edge,
-                        ${SHORT} AS short,
-                        ${lbl} AS lbl,
-                        t - lagInFrame(t, 1, -1e12) OVER w > ${GAP_SECONDS}
-                            OR lagInFrame(kind = 'event' AND name = 'session_ended', 1, false) OVER w AS brk
-                    FROM events FINAL
-                    WHERE ${w.where}
-                    WINDOW w AS (PARTITION BY user_id ORDER BY at, id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-                )
-            ),
-            j AS (
-                SELECT user_id, jn, min(t) AS start, max(t) AS end,
-                    countIf(kind = 'event' AND name = 'session_started') > 0 AS started,
-                    countIf(kind = 'event' AND name = 'session_ended') > 0 AS ended,
-                    -- session_ended carries the game's own session length; the first/last
-                    -- event span undercounts sessions that began before the window
-                    ifNull(argMaxIf(value, (t, id), kind = 'event' AND name = 'session_ended'), end - start) AS dur,
-                    countIf(kind != 'event') AS clicks,
-                    ${inGroup} AS in_group,
-                    -- every step but the session edges, in order
-                    arrayMap(x -> x.3, arraySort(groupArrayIf((t, id, lbl), NOT edge))) AS steps,
-                    -- clicks: (t, id, label, menu, short target, is button, name)
-                    arraySort(groupArrayIf((t, id, lbl, menu, short, kind = 'button', name), kind != 'event')) AS cl
-                    ${filters.aggregates}
-                FROM e GROUP BY user_id, jn
+        SELECT user_id, start, end, started, ended, dur, clicks, in_group, steps, cl,
+            -- new = the player's first-ever event is in this journey's session (the
+            -- game's own user_type tag is unreliable)
+            f.first >= end - dur - 5 AS is_new
+        FROM (
+            SELECT user_id, jev[1].1 AS start, jev[-1].1 AS end,
+                arrayExists(x -> x.6 = 'event' AND x.7 = 'session_started', jev) AS started,
+                -- a journey is cut right after session_ended, so only its last event can be one
+                jev[-1].6 = 'event' AND jev[-1].7 = 'session_ended' AS ended,
+                -- session_ended carries the game's own session length; the first/last
+                -- event span undercounts sessions that began before the window
+                ifNull(if(ended, jev[-1].8, NULL), end - start) AS dur,
+                arrayCount(x -> x.6 != 'event', jev) AS clicks,
+                arrayFold((acc, x) -> bitOr(acc, x.9), jev, toUInt64(0)) AS marks,
+                ${inGroup} AS in_group,
+                -- every step but the session edges, in order
+                arrayMap(x -> x.3, arrayFilter(x -> NOT (x.6 = 'event' AND x.7 IN ('session_started', 'session_ended', 'teleported')), jev)) AS steps,
+                -- clicks: (t, id, label, menu, short target, is button, name)
+                arrayMap(x -> (x.1, x.2, x.3, x.4, x.5, x.6 = 'button', x.7), arrayFilter(x -> x.6 != 'event', jev)) AS cl
+            FROM (
+                SELECT user_id, arraySort(x -> (x.1, x.2), groupArray((
+                    toUnixTimestamp64Milli(at) / 1000, id, ${lbl}, menu, ${SHORT} AS short, kind, name, value, ${mark}))) AS ev
+                FROM events FINAL
+                WHERE ${w.where}
+                GROUP BY user_id
             )
-        SELECT * FROM (
-            SELECT j.*,
-                -- new = the player's first-ever event is in this journey's session (the
-                -- game's own user_type tag is unreliable)
-                f.first >= j.end - j.dur - 5 AS is_new
-            FROM j LEFT JOIN (
-                SELECT user_id, min(toUnixTimestamp64Milli(at)) / 1000 AS first FROM events
-                WHERE user_id IN (SELECT user_id FROM events WHERE ${w.where}) GROUP BY user_id
-            ) AS f USING user_id
-        ) WHERE ${filters.where}`,
-        { session, params: w.params },
+            -- split before an event that follows a gap or a session_ended; the previous
+            -- event's time and flag are shifted copies of two columns, not of ev
+            ARRAY JOIN arraySplit((x, prev_t, prev_ended) -> x.1 - prev_t > ${GAP_SECONDS} OR prev_ended, ev,
+                arrayPushFront(arrayPopBack(arrayMap(x -> x.1, ev)), 0),
+                arrayPushFront(arrayPopBack(arrayMap(x -> x.6 = 'event' AND x.7 = 'session_ended', ev)), false)) AS jev
+        ) AS j LEFT JOIN (
+            SELECT user_id, min(toUnixTimestamp64Milli(at)) / 1000 AS first FROM events
+            WHERE user_id IN (SELECT user_id FROM events WHERE ${w.where}) GROUP BY user_id
+        ) AS f USING user_id
+        WHERE ${where.join(' AND ') || '1'}`,
+        // Each output row carries a player's or journey's whole path, so the default
+        // 50 MB in-order blocks and 256 MB insert blocks would each hold thousands
+        // of them at once; keep both small.
+        { session, params: w.params, settings: {
+            optimize_aggregation_in_order: 1,
+            aggregation_in_order_max_block_bytes: 1_000_000,
+            min_insert_block_size_bytes: 16_000_000,
+        } },
     );
 }
 
@@ -269,24 +277,29 @@ async function* eventRows(res) {
     if (rest) yield parse(rest);
 }
 
-// The events of the journeys in `picked` (a SELECT over jr giving user_id, start,
-// end), streamed in player then time order.
+// The events of the players in `picked` (a SELECT over jr giving user_id, start,
+// end), streamed in player then time order. No join: the table is read in its own
+// (user_id, at, id) order, so nothing is sorted or held; journeysOf drops the
+// player's journeys that weren't picked.
 const journeyEvents = (db, session, w, picked) =>
     db.query(
         `SELECT toUnixTimestamp64Milli(at) / 1000 AS t, user_id, session_id, place, kind, name, menu, x, y, value, props
-        FROM events AS e FINAL INNER JOIN (${picked}) AS p ON e.user_id = p.user_id
-        WHERE ${w.where} AND t >= p.start AND t <= p.end
+        FROM events FINAL
+        WHERE ${w.where} AND user_id IN (SELECT user_id FROM (${picked}))
         ORDER BY user_id, at, id
         FORMAT JSONEachRow`,
         { session, params: w.params, settings: { output_format_json_quote_64bit_integers: 0 } },
     );
 
-// buildJourneys one player at a time, so memory holds one player's events
+// buildJourneys one player at a time, so memory holds one player's events;
+// yields only the picked journeys (the keys of isNew)
 async function* journeysOf(rows, isNew) {
     let events = [];
     const flush = function* () {
         for (const j of buildJourneys(events)) {
-            j.userType = isNew.get(`${j.userId}@${j.start}`) ? 'new' : 'returning';
+            const key = `${j.userId}@${j.start}`;
+            if (!isNew.has(key)) continue;
+            j.userType = isNew.get(key) ? 'new' : 'returning';
             yield j;
         }
         events = [];
