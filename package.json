@@ -6,6 +6,7 @@
   "scripts": {
     "start": "bun src/server.mjs",
     "analyze": "bun src/analyze.mjs",
-    "test": "sh test/run.sh"
+    "test": "sh test/run.sh",
+    "test:stress": "sh test/stress.sh"
   }
 }

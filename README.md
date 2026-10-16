@@ -37,6 +37,27 @@ Studio's sink just retries quietly.
 ```sh
 npm test           # starts a throwaway ClickHouse in Docker
 CLICKHOUSE_URL=http://127.0.0.1:8123 npm test   # or uses yours (each test makes its own database)
+npm run test:stress # 20M-row, all-endpoint memory and concurrency suite
+```
+
+The stress suite creates an isolated database, generates a seven-day adversarial
+workload, exercises every HTTP endpoint, and removes the database afterward. It
+includes many distinct players, repeated journeys per player, a 250k-event hot
+player, purchases, experiment intersections, all-arm confidence intervals,
+daily series, large streamed journey responses, and concurrent reads. Each
+analytical request is tagged with `log_comment`; `system.query_log.memory_usage`
+is checked against a 1.2 GB peak-query budget, while the Node process is checked
+against a 2.5 GB RSS budget. A JSON report is written to `stress-results.json`.
+
+The `stress` GitHub Actions workflow runs this weekly and on demand against the
+same ClickHouse 26.9 generation used in production. Scale and failure thresholds
+are configurable with `STRESS_ROWS`, `STRESS_PLAYERS`, `STRESS_HOT_ROWS`,
+`STRESS_QUERY_MEMORY_BYTES`, `STRESS_QUERY_BUDGET_BYTES`,
+`STRESS_APP_BUDGET_BYTES`, `STRESS_REQUEST_TIMEOUT_MS`, and
+`STRESS_CONCURRENCY`. For example, a production-SLO run is:
+
+```sh
+STRESS_REQUEST_TIMEOUT_MS=30000 STRESS_ROWS=20000000 npm run test:stress
 ```
 
 | env | default | |
