@@ -107,8 +107,8 @@ For data reads over HTTP, use
 
 | endpoint | returns | |
 | --- | --- | --- |
-| `GET /report` | markdown | the report below; `timelines=20` |
-| `GET /paths` | markdown | steps, purchase prompts, and transitions or what follows a path |
+| `GET /report` | markdown / JSON | the report below; `timelines=20`; all-arm experiment metrics |
+| `GET /paths` | markdown / JSON | steps, purchases, transitions, and all-arm experiment metrics |
 | `GET /configs` | JSON | every config key and latest arm per player; supports repeated config filters |
 | `GET /journeys` | JSON | the newest `limit` (100) journeys in full; `user_id=` for one player |
 
@@ -134,6 +134,8 @@ All three also accept journey-level filters, which can be combined:
 | `place=casual` | at least one event has that exact place |
 | `event=UI:Opened:Shop` | at least one raw event has that exact name; button targets use their full path without `click ` |
 | `menu=Shop` | at least one click happened while that exact menu was open |
+| `platform`, `device`, `level`, `country` | event props contain that exact value |
+| `spender=1` / `spender=0` | player did / did not complete a purchase in the window |
 
 The CLI uses the dashed equivalents, for example
 `--min-duration 3m --max-clicks 20 --ended 1 --user-type new --place casual`.
@@ -145,16 +147,39 @@ compare every observed arm and `--purchase-limit` for the purchase table.
 `UI:Opened:Chaos>click React/…/Cards/TacticalNuke/Catcher`: what came next after
 them, `(quit)` or `(end of window)` included), and `limit` (40 step, transition,
 or follow-up rows). `purchase_limit` independently controls purchase rows (40),
-so a small path limit does not hide products. The purchase table includes prompt
-and purchase events, distinct prompted players and buyers, and distinct new and
-returning buyers. Its steps are event names, `click <full button path>` and world
-targets (full paths, unlike the report's shortened ones).
+so a small path limit does not hide products. The purchase table includes an
+all-products row and per-product rows split by experiment arm, prompt and purchase
+events, distinct prompted players and buyers, distinct new and returning buyers,
+repeat buyers, and receipt-price R$ spend. Its steps are event names,
+`click <full button path>` and world targets (full paths, unlike the report's
+shortened ones).
 
 For a side-by-side step comparison across every observed arm, provide one config
 key, for example `compare=chaos_catalog`. Players are assigned to their latest
 value for that key in the window. The result gives times, distinct players, and
 player share for each step in every arm, with arms ordered by value. Common
 `config` filters may still be repeated for other experiment keys.
+
+Both `/paths` and `/report` accept the full experiment query:
+
+```text
+?compare=<key>&control=<arm>&ci=1&series=daily&since=7d&until=<timestamp>
+```
+
+Each player is assigned once to their latest arm; blank arms are omitted unless
+`blank=1`. Conversion and D1 use 95% Wilson intervals. Spend per player and
+session median/mean/p90 use deterministic player-level bootstrap intervals. Each
+metric includes its value, bounds, sample size, relative lift (with bounds), and
+chance of beating control. `series=daily` adds cumulative daily points through
+the same `until` for every arm. `dist=spend|session|purchases` adds player-level
+distributions, including spend buckets (0, 1-50, 51-200, 200+ R$) and top-1%
+share. `format=json` returns typed experiment data and structured report tables;
+Markdown remains the default. Identical comparisons are cached for 60 seconds.
+For D1, eligible players have a complete 48-hour observation window and a return
+means any event from 24 through 48 hours after their first exposure to that arm.
+
+Buyers are distinct players with a `Purchase:PromptFinished` event whose
+`purchased` property is true, regardless of how many products they bought.
 
 `/configs` powers the explorer. It applies the same time, user, Studio, and
 repeated `config` intersection filters, then returns every config distribution
