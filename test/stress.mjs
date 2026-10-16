@@ -25,6 +25,7 @@ const TOKEN = 'stress-secret';
 const database = `stress_${Date.now()}_${process.pid}`;
 const db = openDb({ database });
 const results = [];
+const caseFailures = [];
 let server;
 let activeTag = '';
 
@@ -166,7 +167,8 @@ async function queryMetrics(tag) {
         FROM system.query_log
         WHERE log_comment = {tag:String} AND type = 'QueryFinish'
         ORDER BY memory_usage DESC LIMIT 1`, { params: { tag } });
-    const failures = await db.rows(`SELECT exception_code, substring(exception, 1, 500) AS exception
+    const failures = await db.rows(`SELECT exception_code, substring(exception, 1, 500) AS exception,
+            substring(replaceRegexpAll(query, '\\s+', ' '), 1, 500) AS query
         FROM system.query_log
         WHERE log_comment = {tag:String} AND type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing')
         ORDER BY event_time_microseconds`, { params: { tag } });
@@ -211,12 +213,18 @@ async function measuredRequest(name, path, {
     };
     results.push(result);
     console.log(JSON.stringify(result));
-    if (requestError) throw requestError;
-    assert.equal(Number(metrics.failed), 0, `${name}: ClickHouse logged a failed query`);
-    assert.ok(result.clickhousePeakBytes <= QUERY_BUDGET,
-        `${name}: ClickHouse peak ${result.clickhousePeakMiB} MiB exceeds ${mib(QUERY_BUDGET)} MiB`);
-    assert.ok(result.appMaxRssBytes <= APP_BUDGET,
-        `${name}: app peak RSS ${result.appMaxRssMiB} MiB exceeds ${mib(APP_BUDGET)} MiB`);
+    try {
+        if (requestError) throw requestError;
+        assert.equal(Number(metrics.failed), 0, `${name}: ClickHouse logged a failed query`);
+        assert.ok(result.clickhousePeakBytes <= QUERY_BUDGET,
+            `${name}: ClickHouse peak ${result.clickhousePeakMiB} MiB exceeds ${mib(QUERY_BUDGET)} MiB`);
+        assert.ok(result.appMaxRssBytes <= APP_BUDGET,
+            `${name}: app peak RSS ${result.appMaxRssMiB} MiB exceeds ${mib(APP_BUDGET)} MiB`);
+    } catch (error) {
+        result.failure = String(error.stack ?? error);
+        caseFailures.push({ name, failure: result.failure, clickhouse: metrics.failures });
+        console.error(`${name} failed: ${error.message}`);
+    }
     return result;
 }
 
@@ -253,12 +261,18 @@ async function measuredConcurrent(name, paths) {
     };
     results.push(result);
     console.log(JSON.stringify(result));
-    if (requestError) throw requestError;
-    assert.equal(Number(metrics.failed), 0, `${name}: ClickHouse logged a failed query`);
-    assert.ok(result.clickhousePeakBytes <= QUERY_BUDGET,
-        `${name}: ClickHouse peak ${result.clickhousePeakMiB} MiB exceeds ${mib(QUERY_BUDGET)} MiB`);
-    assert.ok(result.appMaxRssBytes <= APP_BUDGET,
-        `${name}: app peak RSS ${result.appMaxRssMiB} MiB exceeds ${mib(APP_BUDGET)} MiB`);
+    try {
+        if (requestError) throw requestError;
+        assert.equal(Number(metrics.failed), 0, `${name}: ClickHouse logged a failed query`);
+        assert.ok(result.clickhousePeakBytes <= QUERY_BUDGET,
+            `${name}: ClickHouse peak ${result.clickhousePeakMiB} MiB exceeds ${mib(QUERY_BUDGET)} MiB`);
+        assert.ok(result.appMaxRssBytes <= APP_BUDGET,
+            `${name}: app peak RSS ${result.appMaxRssMiB} MiB exceeds ${mib(APP_BUDGET)} MiB`);
+    } catch (error) {
+        result.failure = String(error.stack ?? error);
+        caseFailures.push({ name, failure: result.failure, clickhouse: metrics.failures });
+        console.error(`${name} failed: ${error.message}`);
+    }
 }
 
 let base;
@@ -334,6 +348,10 @@ async function run() {
         `/paths?${query({ ...comparison, dist: ['spend', 'session', 'purchases'][index % 3],
             limit: 100 + index, purchase_limit: 100 + index })}`);
     await measuredConcurrent('concurrent-heavy-reads', concurrent);
+    if (caseFailures.length) {
+        throw new Error(`${caseFailures.length} stress cases failed:\n`
+            + caseFailures.map((item) => `- ${item.name}: ${item.failure.split('\n')[0]}`).join('\n'));
+    }
 }
 
 let failure;
@@ -351,6 +369,7 @@ try {
             queryMemoryBytes: QUERY_MEMORY, queryBudgetBytes: QUERY_BUDGET,
             appBudgetBytes: APP_BUDGET, requestTimeoutMs: REQUEST_TIMEOUT, concurrency: CONCURRENCY,
         },
+        caseFailures,
         failure: failure ? String(failure.stack ?? failure) : null,
         results,
     }, null, 2));
