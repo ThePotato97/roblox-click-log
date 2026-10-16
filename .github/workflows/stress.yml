@@ -1,0 +1,71 @@
+name: stress
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "test/**"
+      - "package.json"
+      - ".github/workflows/stress.yml"
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: Synthetic event rows
+        required: true
+        default: "20000000"
+      players:
+        description: Distinct players
+        required: true
+        default: "50000"
+      concurrency:
+        description: Concurrent heavy reads
+        required: true
+        default: "2"
+  schedule:
+    - cron: "17 3 * * 0"
+
+concurrency:
+  group: stress-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  endpoints:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.9
+        env:
+          CLICKHOUSE_PASSWORD: test
+        ports:
+          - 8123:8123
+        options: >-
+          --memory=6g
+          --health-cmd "wget -q -O- http://127.0.0.1:8123/ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Stress every endpoint
+        env:
+          CLICKHOUSE_URL: http://127.0.0.1:8123
+          CLICKHOUSE_PASSWORD: test
+          STRESS_ROWS: ${{ inputs.rows || '20000000' }}
+          STRESS_PLAYERS: ${{ inputs.players || '50000' }}
+          STRESS_CONCURRENCY: ${{ inputs.concurrency || '2' }}
+          NODE_OPTIONS: --max-old-space-size=3072
+        run: npm run test:stress
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: click-log-stress-results
+          path: stress-results.json
+          if-no-files-found: warn
+          retention-days: 14
