@@ -341,10 +341,13 @@ async function experimentStats(db, session, w, query, options) {
             groupArrayIf((at, price), purchased) AS buys,
             groupArrayIf(at, prompted) AS prompts
         FROM purchase_events GROUP BY arm, user_id`, { session });
+    // Keep the large raw event stream on the left. ClickHouse builds its hash
+    // table from the right-hand side, so putting events there can consume the
+    // whole query memory limit before join_algorithm=auto has a chance to spill.
     const returns = await db.rows(`SELECT p.arm AS arm, p.user_id AS user_id,
             countIf(toUnixTimestamp64Milli(e.at) / 1000 >= p.first_exposure + 86400
                 AND toUnixTimestamp64Milli(e.at) / 1000 < p.first_exposure + 172800) > 0 AS d1
-        FROM selected_players AS p INNER JOIN events AS e FINAL USING user_id
+        FROM events AS e FINAL INNER JOIN selected_players AS p USING user_id
         WHERE ${w.where}
         GROUP BY p.arm, p.user_id, p.first_exposure`, { session, params: w.params });
     const purchaseMap = new Map(purchases.map((row) => [`${row.arm}\0${row.user_id}`, row]));
