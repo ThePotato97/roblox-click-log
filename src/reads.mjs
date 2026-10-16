@@ -17,6 +17,9 @@ const READ_SETTINGS = {
     max_threads: 4,
     join_algorithm: 'auto',
 };
+// A join's right side is loaded into memory, so events (millions of rows) stay on
+// the left of a join against a per-player table, and the planner may not swap them.
+const EVENTS_PROBE = { query_plan_join_swap_table: 'false' };
 const READ_CACHE_TTL_MS = 60_000;
 const READ_CACHE_MAX = 32;
 const READ_CACHES = new WeakMap();
@@ -303,7 +306,7 @@ async function selectedPlayersTable(db, session, compared = true) {
 
 async function purchaseEventsTable(db, session, w) {
     await db.exec(`CREATE TEMPORARY TABLE purchase_events ENGINE = MergeTree ORDER BY (arm, user_id, at, id) AS
-        SELECT CAST(p.arm, 'String') AS arm, CAST(e.user_id, 'Int64') AS user_id,
+        SELECT CAST(j.arm, 'String') AS arm, CAST(e.user_id, 'Int64') AS user_id,
             CAST(j.is_new, 'UInt8') AS is_new,
             toUnixTimestamp64Milli(e.at) / 1000 AS at, CAST(e.id, 'String') AS id,
             if(JSONHas(e.props, 'name'), JSONExtractString(e.props, 'name'), '?') AS product,
@@ -314,12 +317,12 @@ async function purchaseEventsTable(db, session, w) {
             CAST(materialize(e.name) = 'Purchase:PromptFinished' AND JSONExtractBool(e.props, 'purchased'), 'UInt8') AS purchased,
             CAST(materialize(e.name) = 'Purchase:PromptFinished' AND NOT JSONExtractBool(e.props, 'purchased'), 'UInt8') AS cancelled
         FROM events AS e FINAL
-        INNER JOIN selected_players AS p USING user_id
-        INNER JOIN (SELECT user_id, start, end, is_new FROM jr WHERE in_group) AS j USING user_id
-        WHERE ${w.where} AND e.kind = 'event'
+        INNER JOIN (SELECT user_id, p.arm AS arm, j.start AS start, j.end AS end, j.is_new AS is_new
+            FROM selected_players AS p INNER JOIN jr AS j USING user_id WHERE j.in_group) AS j USING user_id
+        WHERE ${w.where} AND e.user_id IN (SELECT user_id FROM selected_players) AND e.kind = 'event'
             AND e.name IN ('Purchase:PromptOpened', 'Purchase:PromptFinished')
             AND toUnixTimestamp64Milli(e.at) / 1000 BETWEEN j.start AND j.end`,
-    { session, params: w.params });
+    { session, params: w.params, settings: EVENTS_PROBE });
 }
 
 function dailyCutoffs(since, until) {
@@ -344,9 +347,9 @@ async function experimentStats(db, session, w, query, options) {
     const returns = await db.rows(`SELECT p.arm AS arm, p.user_id AS user_id,
             countIf(toUnixTimestamp64Milli(e.at) / 1000 >= p.first_exposure + 86400
                 AND toUnixTimestamp64Milli(e.at) / 1000 < p.first_exposure + 172800) > 0 AS d1
-        FROM selected_players AS p INNER JOIN events AS e FINAL USING user_id
-        WHERE ${w.where}
-        GROUP BY p.arm, p.user_id, p.first_exposure`, { session, params: w.params });
+        FROM events AS e FINAL INNER JOIN selected_players AS p USING user_id
+        WHERE ${w.where} AND e.user_id IN (SELECT user_id FROM selected_players)
+        GROUP BY p.arm, p.user_id, p.first_exposure`, { session, params: w.params, settings: EVENTS_PROBE });
     const purchaseMap = new Map(purchases.map((row) => [`${row.arm}\0${row.user_id}`, row]));
     const returnMap = new Map(returns.map((row) => [`${row.arm}\0${row.user_id}`, Boolean(row.d1)]));
     const dataCutoff = w.until ?? Date.now() / 1000;
