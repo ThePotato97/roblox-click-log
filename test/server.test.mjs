@@ -325,8 +325,14 @@ test('repeated config filters survive HTTP parsing and are ANDed', async () => {
         })).json();
         assert.equal(configs.players, 3);
         assert.deepEqual(configs.configs, [
-            { key: 'chaos_catalog', players: 3, arms: [{ value: 'disasters', players: 1 }, { value: 'power', players: 2 }] },
-            { key: 'chaos_label', players: 3, arms: [{ value: 'icons', players: 2 }, { value: 'text', players: 1 }] },
+            { key: 'chaos_catalog', players: 3, arms: [
+                { value: 'disasters', players: 1, firstExposure: '2026-09-21T14:13:20.000Z' },
+                { value: 'power', players: 2, firstExposure: '2026-09-21T14:13:20.000Z' },
+            ] },
+            { key: 'chaos_label', players: 3, arms: [
+                { value: 'icons', players: 2, firstExposure: '2026-09-21T14:13:21.000Z' },
+                { value: 'text', players: 1, firstExposure: '2026-09-21T14:13:21.000Z' },
+            ] },
         ]);
 
         const sliced = await (await fetch(`${base}/configs?since=${T0 - 1}&config=chaos_catalog%3Apower`, {
@@ -334,7 +340,19 @@ test('repeated config filters survive HTTP parsing and are ANDed', async () => {
         })).json();
         assert.equal(sliced.players, 2);
         assert.deepEqual(sliced.configs.find((config) => config.key === 'chaos_label').arms,
-            [{ value: 'icons', players: 1 }, { value: 'text', players: 1 }]);
+            [
+                { value: 'icons', players: 1, firstExposure: '2026-09-21T14:13:21.000Z' },
+                { value: 'text', players: 1, firstExposure: '2026-09-21T14:13:21.000Z' },
+            ]);
+
+        const compared = await (await fetch(`${base}/configs?since=${T0 - 1}&compare=chaos_catalog`, {
+            headers: { Authorization: 'Bearer secret' },
+        })).json();
+        assert.deepEqual(compared.interactions, [
+            { compareArm: 'disasters', config: 'chaos_label', arm: 'icons', players: 1, playerShare: 1 },
+            { compareArm: 'power', config: 'chaos_label', arm: 'icons', players: 1, playerShare: 0.5 },
+            { compareArm: 'power', config: 'chaos_label', arm: 'text', players: 1, playerShare: 0.5 },
+        ]);
     }, db);
 });
 
@@ -364,7 +382,116 @@ test('/paths discovers every experiment arm and compares per-step player share',
     assert.match(sliced, /\| power players \| 1 \|/);
     assert.equal((await read(db, '/paths', { compare: 'chaos_catalog:power' })).status, 400);
     assert.equal((await read(db, '/paths', { compare: ['chaos_catalog', 'chaos_label'] })).status, 400);
-    assert.equal((await read(db, '/report', { compare: 'chaos_catalog' })).status, 400);
+    assert.equal((await read(db, '/report', { compare: 'chaos_catalog' })).status, 200);
+});
+
+test('compare API returns latest-arm player metrics, confidence bounds, daily series and arm purchases', { timeout: 30_000 }, async () => {
+    const exposure = (userId, at, value) => ev(userId, at, 'event', 'config_exposure', {
+        props: { key: 'offer', value },
+    });
+    const prompt = (userId, at, product, purchased, receiptPrice, source = 'shop') => [
+        ev(userId, at, 'event', 'Purchase:PromptOpened', {
+            props: { name: product, price: 999, source },
+        }),
+        ev(userId, at + 1, 'event', 'Purchase:PromptFinished', {
+            props: { name: product, price: 999, receipt_price: receiptPrice, purchased },
+        }),
+    ];
+    const day = 86400;
+    const db = await freshDb([
+        exposure(1, 0, 'control'), ev(1, 1, 'event', 'session_started'),
+        ...prompt(1, 2, 'Small', true, 30), ...prompt(1, 4, 'Medium', true, 40),
+        ev(1, 20, 'event', 'session_ended', { value: 20 }), ev(1, day + 3600, 'event', 'D1'),
+        exposure(2, 0, 'control'), ev(2, 1, 'event', 'session_started'),
+        ...prompt(2, 2, 'Small', false, 0), ev(2, 10, 'event', 'session_ended', { value: 10 }),
+        exposure(3, 0, 'treatment'), ev(3, 1, 'event', 'session_started'),
+        ...prompt(3, 2, 'Large', true, 300, 'auto'), ev(3, 30, 'event', 'session_ended', { value: 30 }),
+        ev(3, day + 3600, 'event', 'D1'),
+        exposure(4, 0, 'control'), exposure(4, 10, 'treatment'), ev(4, 11, 'event', 'session_started'),
+        ev(4, 51, 'event', 'session_ended', { value: 40 }), ev(4, day + 3600, 'event', 'D1'),
+        exposure(5, 0, ''), ev(5, 1, 'event', 'session_started'),
+        ...prompt(5, 2, 'BlankProduct', true, 10), ev(5, 12, 'event', 'session_ended', { value: 12 }),
+    ]);
+    const query = {
+        compare: 'offer', control: 'control', ci: '1', series: 'daily', dist: 'spend',
+        until: String(T0 + 3 * day), format: 'json', timelines: '0',
+    };
+    const pathsResult = await read(db, '/paths', query);
+    assert.equal(pathsResult.status, 200);
+    assert.equal(pathsResult.type, 'application/json');
+    const pathsJson = JSON.parse(pathsResult.body);
+    assert.equal(pathsJson.experiment.control, 'control');
+    assert.equal(pathsJson.experiment.confidence, 0.95);
+    assert.ok(pathsJson.experiment.series.length >= 3);
+    const pathArms = Object.fromEntries(pathsJson.experiment.arms.map((arm) => [arm.arm, arm]));
+    assert.deepEqual(Object.keys(pathArms), ['control', 'treatment']);
+    assert.equal(pathArms.control.metrics.players.value, 2);
+    assert.equal(pathArms.treatment.metrics.players.value, 2); // user 4's latest exposure wins
+    assert.equal(pathArms.control.metrics.conversion.value, 0.5); // user 1 counted once across two products
+    assert.equal(pathArms.control.metrics.promptedConversion.value, 0.5);
+    assert.equal(pathArms.control.metrics.spendPerPlayer.value, 35); // receipt prices, not list prices
+    assert.equal(pathArms.treatment.metrics.spendPerPlayer.value, 150);
+    assert.equal(pathArms.control.metrics.d1Return.value, 0.5);
+    for (const arm of Object.values(pathArms)) {
+        for (const name of ['conversion', 'promptedConversion', 'spendPerPlayer', 'sessionMedian', 'sessionMean', 'sessionP90', 'd1Return']) {
+            const metric = arm.metrics[name];
+            assert.ok(metric.n > 0, `${arm.arm} ${name} has n`);
+            assert.notEqual(metric.lower, null, `${arm.arm} ${name} has lower bound`);
+            assert.notEqual(metric.upper, null, `${arm.arm} ${name} has upper bound`);
+            assert.notEqual(metric.liftVsControl, null, `${arm.arm} ${name} has lift`);
+            assert.notEqual(metric.chanceBeatsControl, null, `${arm.arm} ${name} has chance`);
+        }
+    }
+    assert.deepEqual(pathArms.control.distributions.spend.buckets.map(({ bucket, players }) => [bucket, players]),
+        [['0', 1], ['1-50', 0], ['51-200', 1], ['200+', 0]]);
+    assert.equal(pathArms.control.distributions.purchases.repeatBuyers, 1);
+
+    const reportJson = JSON.parse((await read(db, '/report', query)).body);
+    assert.deepEqual(reportJson.experiment.arms.map((arm) => [arm.arm, arm.metrics.players.value]),
+        pathsJson.experiment.arms.map((arm) => [arm.arm, arm.metrics.players.value]));
+
+    const markdown = (await read(db, '/paths', { ...query, format: 'markdown' })).body;
+    assert.match(markdown, /\| control \| Any product \| 3 \| 2 \| 1 \| 2 \| 1 \| 1 \| 0 \| 1 \| 70 \|/);
+    assert.match(markdown, /\| treatment \| Any product \| 1 \| 1 \| 0 \| 1 \| 1 \| 1 \| 0 \| 0 \| 300 \|/);
+    assert.doesNotMatch(markdown, /BlankProduct/);
+
+    const withBlank = JSON.parse((await read(db, '/paths', {
+        ...query, blank: '1', ci: '0', series: '', format: 'json',
+    })).body);
+    assert.deepEqual(withBlank.experiment.arms.map((arm) => arm.arm), ['', 'control', 'treatment']);
+    assert.equal(withBlank.experiment.arms[0].metrics.players.value, 1);
+    assert.equal(withBlank.experiment.arms[0].metrics.conversion.lower, null);
+
+    assert.equal((await read(db, '/paths', { compare: 'offer', ci: '1' })).status, 400);
+    assert.equal((await read(db, '/paths', { compare: 'offer', control: 'missing', ci: '1' })).status, 400);
+    assert.equal((await read(db, '/paths', { compare: 'offer', series: 'weekly' })).status, 400);
+    assert.equal((await read(db, '/paths', { compare: 'offer', format: 'csv' })).status, 400);
+
+    let calls = 0;
+    const counted = Object.fromEntries(['exec', 'rows', 'query'].map((method) => [method, (...args) => {
+        calls++;
+        return db[method](...args);
+    }]));
+    const cachedQuery = { ...query, limit: '17' };
+    assert.equal((await read(counted, '/paths', cachedQuery)).status, 200);
+    const afterFirst = calls;
+    assert.ok(afterFirst > 0);
+    assert.equal((await read(counted, '/paths', cachedQuery)).status, 200);
+    assert.equal(calls, afterFirst, 'the second identical comparison is served from cache');
+});
+
+test('a failed report returns one JSON 5xx response, never a partial Markdown table', async () => {
+    const unavailable = Object.fromEntries(['exec', 'rows', 'query'].map((method) => [method, async () => {
+        throw Object.assign(new Error(`failed ${method}`), { clickhouse: true });
+    }]));
+    await withServer(async (base) => {
+        const response = await fetch(`${base}/paths?compare=offer`, {
+            headers: { Authorization: 'Bearer secret' },
+        });
+        assert.equal(response.status, 503);
+        assert.match(response.headers.get('content-type'), /^application\/json/);
+        assert.deepEqual(await response.json(), { error: 'internal error' });
+    }, unavailable);
 });
 
 test('purchase rows have independent limits and unique buyer cohorts', async () => {

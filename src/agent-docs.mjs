@@ -29,13 +29,14 @@ read token and keeps it in browser session storage.
 
 ### GET /report
 
-Returns Markdown. Default window: \`since=7d\`. The report contains overview,
+Returns Markdown (or structured JSON with \`format=json\`). Default window: \`since=7d\`. The report contains overview,
 exit points, new-player openings, clicks, reach, rage clicks, sequences,
 transitions, and recent journey timelines. Set \`timelines=0\` to omit timelines.
+It accepts the same experiment comparison parameters as \`/paths\`.
 
 ### GET /paths
 
-Returns Markdown. Default window: \`since=24h\`. It includes full step names,
+Returns Markdown (or structured JSON with \`format=json\`). Default window: \`since=24h\`. It includes full step names,
 purchase prompts, and transitions. Parameters specific to this endpoint:
 
 - \`match=<regex>\`: case-insensitive filter on displayed step/transition names.
@@ -45,9 +46,20 @@ purchase prompts, and transitions. Parameters specific to this endpoint:
 - \`compare=<config key>\`: discover every observed arm and show side-by-side
   step counts, distinct players, and player share, for example
   \`compare=chaos_catalog\`. Each player uses their latest value in the window.
+- \`control=<arm>&ci=1\`: add 95% Wilson intervals to conversion rates,
+  player-bootstrap intervals to spend and session metrics, relative lift with
+  bounds, and the bootstrap chance that each arm beats the control. D1 counts
+  any event 24-48 hours after first arm exposure, only with a full 48-hour window.
+- \`series=daily\`: return cumulative daily metrics through one shared \`until\`.
+- \`blank=1\`: include the blank arm; blank arms are excluded by default.
+- \`dist=spend|session|purchases\`: include the selected distribution. Spend
+  includes 0, 1-50, 51-200, and 200+ R$ buckets, percentiles, and top-1% share.
+- \`format=json\`: return typed experiment metrics and structured report tables.
 
-The purchase table reports prompt, purchase, and cancellation events; distinct
-prompted players and buyers; and distinct new and returning buyers.
+The purchase table is split by arm and reports prompt, purchase, and cancellation
+events; distinct prompted players and buyers; distinct new and returning buyers;
+repeat buyers; receipt-price R$ spend; and an \`Any product\` row. A buyer is a
+distinct player with \`Purchase:PromptFinished\` and \`purchased=true\`.
 
 Button steps are written as \`click <full button path>\`. URL-encode \`>\`, spaces,
 slashes, and other reserved characters in requests.
@@ -75,7 +87,8 @@ Journey-level filters such as duration and clicks do not apply to this endpoint.
 - \`studio=0\`: exclude Studio playtests.
 - \`config=key:value\`: select an experiment value; \`config=key\` selects anyone
   exposed. Repeat the parameter to AND filters across different keys. Conflicting
-  values for one key return \`400\`; use \`compare\` on \`/paths\` for all arms.
+  values for one key return \`400\`; use \`compare\` on \`/paths\` or \`/report\`
+  for all arms.
 - \`min_duration\`, \`max_duration\`: inclusive journey-duration bounds. Accept
   seconds or \`s\`, \`m\`, \`h\`, \`d\`, for example \`30s\` or \`5m\`.
 - \`min_clicks\`, \`max_clicks\`: inclusive non-event click-count bounds.
@@ -86,6 +99,9 @@ Journey-level filters such as duration and clicks do not apply to this endpoint.
 - \`event=<exact raw event name>\`: at least one event with that name. For a
   button, use its full target path without the \`click \` prefix.
 - \`menu=<exact menu>\`: at least one click while that menu was open.
+- \`platform\`, \`device\`, \`level\`, \`country\`: require an exact matching
+  value in event props within the journey.
+- \`spender=1|0\`: include or exclude players with a completed purchase in the window.
 
 Journey duration uses the game's duration on \`session_ended\` when present;
 otherwise it is the span between the first and last event visible in the window.
@@ -97,6 +113,8 @@ otherwise it is the span between the first and last event visible in the window.
 \`GET /paths?since=7d&user_type=new&path=UI%3AOpened%3AChaos&limit=20\`
 
 \`GET /paths?compare=chaos_catalog&purchase_limit=100\`
+
+\`GET /paths?compare=chaos_catalog&control=power&ci=1&series=daily&since=7d&until=2026-10-16T00%3A00%3A00Z&format=json\`
 
 \`GET /configs?since=7d&config=chaos_label%3Aicons\`
 
